@@ -1,0 +1,6 @@
+The panel structure and Omarchy UI patterns were informed by Aayush Stha's
+"Meeting Notes for Omarchy" project, distributed under the MIT License:
+https://github.com/Aayushstha03/omarchy-meeting-notes
+
+This plugin uses the locally installed Voxtype CLI and optionally Ollama. It
+does not bundle either project.

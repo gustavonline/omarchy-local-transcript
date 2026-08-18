@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.gustavonline.local-meeting",
+  "name": "Local Meeting",
+  "version": "0.1.0",
+  "author": "Gustav",
+  "license": "MIT",
+  "description": "Record, transcribe, annotate, and summarize meetings entirely on your machine",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Local Meeting",
+    "description": "Local meeting recording, multilingual transcription, Markdown notes, and optional Ollama summaries",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""Local-only meeting capture backend for the Omarchy Local Meeting widget."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+
+XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+XDG_RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+
+DATA_DIR = XDG_DATA_HOME / "omarchy-local-meeting"
+CONFIG_DIR = XDG_CONFIG_HOME / "omarchy"
+CONFIG_PATH = CONFIG_DIR / "local-meeting.json"
+VOXTYPE_CONFIG = XDG_CONFIG_HOME / "voxtype" / "config.toml"
+VOXTYPE_MODELS = XDG_DATA_HOME / "voxtype" / "models"
+ACTIVE_PATH = DATA_DIR / "active.json"
+LAST_PATH = DATA_DIR / "last.json"
+RUNTIME_STATE = XDG_RUNTIME_DIR / "voxtype" / "meeting_state"
+OLLAMA_SERVICE = XDG_CONFIG_HOME / "systemd/user/omarchy-local-meeting-ollama.service"
+
+VOXTYPE = os.environ.get("LOCAL_MEETING_VOXTYPE", "voxtype")
+OLLAMA = os.environ.get("LOCAL_MEETING_OLLAMA", "ollama")
+FFMPEG = os.environ.get("LOCAL_MEETING_FFMPEG", "ffmpeg")
+PACTL = os.environ.get("LOCAL_MEETING_PACTL", "pactl")
+SYSTEMCTL = os.environ.get("LOCAL_MEETING_SYSTEMCTL", "systemctl")
+HYPRCTL = os.environ.get("LOCAL_MEETING_HYPRCTL", "hyprctl")
+NOTIFY_SEND = os.environ.get("LOCAL_MEETING_NOTIFY_SEND", "notify-send")
+OMARCHY_SHELL = os.environ.get("LOCAL_MEETING_OMARCHY_SHELL", "omarchy-shell")
+
+DEFAULT_OUTPUT = Path.home() / "Documents/Meeting Notes"
+STT_MODELS = {
+    "base": {"label": "Base · light", "size": "142 MB"},
+    "small": {"label": "Small · recommended", "size": "466 MB"},
+    "large-v3-turbo": {"label": "Large Turbo · best", "size": "1.6 GB"},
+}
+SUMMARY_MODELS = {
+    "disabled": {"label": "No AI summary", "size": "0"},
+    "gemma3:1b": {"label": "Gemma 3 1B · light", "size": "815 MB"},
+    "qwen3.5:2b": {"label": "Qwen 3.5 2B · recommended", "size": "2.7 GB"},
+    "qwen3.5:4b": {"label": "Qwen 3.5 4B · quality", "size": "3.4 GB"},
+}
+LANGUAGES = {"auto", "da", "en"}
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def clean(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def read_json(path: Path, default: object) -> object:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value
+    except (OSError, json.JSONDecodeError, TypeError):
+        return default
+
+
+def default_config() -> dict:
+    return {
+        "version": 1,
+        "configured": False,
+        "outputDirectory": str(DEFAULT_OUTPUT),
+        "sttModel": "small",
+        "language": "auto",
+        "summaryModel": "qwen3.5:2b",
+        "autoSummarize": True,
+        "saveAudio": False,
+        "detectMeetings": True,
+        "detectionApps": ["zoom", "teams", "slack", "meet", "discord", "buzz", "webex", "jitsi", "browser"],
+        "customMeetingApps": "",
+    }
+
+
+def load_config() -> dict:
+    config = default_config()
+    candidate = read_json(CONFIG_PATH, {})
+    if isinstance(candidate, dict):
+        config.update(candidate)
+    return config
+
+
+def save_config(config: dict) -> None:
+    config["version"] = 1
+    atomic_json(CONFIG_PATH, config)
+
+
+def expand_path(value: str) -> Path:
+    expanded = Path(os.path.expandvars(value)).expanduser()
+    return expanded if expanded.is_absolute() else Path.home() / expanded
+
+
+def run(command: list[str], *, check: bool = True, timeout: int | None = 30,
+        input_text: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=check,
+    )
+
+
+def command_exists(command: str) -> bool:
+    return bool(shutil.which(command) or Path(command).exists())
+
+
+def toml_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def update_toml(path: Path, values: dict[str, dict[str, object]], remove: dict[str, set[str]] | None = None) -> None:
+    """Update selected TOML keys while preserving unrelated settings and comments."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines()
+    remove = remove or {}
+    seen: set[tuple[str, str]] = set()
+    current = ""
+    result: list[str] = []
+
+    for line in lines:
+        section_match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", line)
+        if section_match:
+            current = section_match.group(1).strip()
+            result.append(line)
+            continue
+        key_match = re.match(r"^(\s*)([A-Za-z0-9_-]+)(\s*=).*$", line)
+        if key_match:
+            key = key_match.group(2)
+            if key in remove.get(current, set()):
+                continue
+            if current in values and key in values[current]:
+                result.append(f"{key_match.group(1)}{key}{key_match.group(3)} {toml_literal(values[current][key])}")
+                seen.add((current, key))
+                continue
+        result.append(line)
+
+    for section, section_values in values.items():
+        missing = [(key, value) for key, value in section_values.items() if (section, key) not in seen]
+        if not missing:
+            continue
+        header_pattern = re.compile(rf"^\s*\[{re.escape(section)}]\s*(?:#.*)?$")
+        header_index = next((index for index, line in enumerate(result) if header_pattern.match(line)), None)
+        new_lines = [f"{key} = {toml_literal(value)}" for key, value in missing]
+        if header_index is None:
+            if result and result[-1].strip():
+                result.append("")
+            result.extend([f"[{section}]", *new_lines])
+        else:
+            insert_at = len(result)
+            for index in range(header_index + 1, len(result)):
+                if re.match(r"^\s*\[[^]]+]", result[index]):
+                    insert_at = index
+                    break
+            while insert_at > header_index + 1 and not result[insert_at - 1].strip():
+                insert_at -= 1
+            result[insert_at:insert_at] = new_lines
+
+    temporary = path.with_suffix(path.suffix + ".local-meeting.tmp")
+    temporary.write_text("\n".join(result).rstrip() + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def apply_voxtype_config(config: dict) -> None:
+    output = expand_path(config["outputDirectory"])
+    internal = output / ".voxtype-data"
+    output.mkdir(parents=True, exist_ok=True)
+    internal.mkdir(parents=True, exist_ok=True)
+    summary_model = config["summaryModel"]
+    if VOXTYPE_CONFIG.exists():
+        backup = DATA_DIR / "voxtype-config.before-local-meeting.toml"
+        if not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(VOXTYPE_CONFIG, backup)
+    whisper_values = {"language": config["language"], "translate": False}
+    if installed_stt(config["sttModel"]):
+        whisper_values["model"] = config["sttModel"]
+    update_toml(
+        VOXTYPE_CONFIG,
+        {
+            "whisper": whisper_values,
+            "meeting": {
+                "enabled": True,
+                "chunk_duration_secs": 30,
+                "storage_path": str(internal),
+                "retain_audio": False,
+                "max_duration_mins": 240,
+            },
+            "meeting.audio": {
+                "mic_device": "default",
+                "loopback_device": "auto",
+                "echo_cancel": "auto",
+                "vad_threshold": 0.005,
+            },
+            "meeting.diarization": {
+                "enabled": True,
+                "backend": "simple",
+                "max_speakers": 10,
+            },
+            "meeting.summary": {
+                "backend": "disabled" if summary_model == "disabled" else "local",
+                "ollama_url": "http://127.0.0.1:11434",
+                "ollama_model": summary_model if summary_model != "disabled" else "qwen3.5:2b",
+                "timeout_secs": 300,
+            },
+        },
+        remove={"meeting.audio": {"source"}},
+    )
+
+
+def restart_voxtype() -> None:
+    if command_exists(SYSTEMCTL):
+        result = run([SYSTEMCTL, "--user", "restart", "voxtype.service"], check=False, timeout=20)
+        if result.returncode == 0:
+            return
+    raise RuntimeError("Could not restart the Voxtype user service")
+
+
+def configure(output: str, stt_model: str, summary_model: str, language: str,
+              save_audio: str, auto_summarize: str, detect_meetings: str,
+              detection_apps_json: str, custom_apps: str) -> None:
+    if stt_model not in STT_MODELS:
+        raise ValueError("Unsupported speech model")
+    if summary_model not in SUMMARY_MODELS or "cloud" in summary_model.lower():
+        raise ValueError("Only the bundled local summary models are allowed")
+    if language not in LANGUAGES:
+        raise ValueError("Unsupported language setting")
+    try:
+        detection_apps = json.loads(detection_apps_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("Invalid meeting app selection") from error
+    allowed_apps = {"zoom", "teams", "slack", "meet", "discord", "buzz", "webex", "jitsi", "browser"}
+    if not isinstance(detection_apps, list) or any(item not in allowed_apps for item in detection_apps):
+        raise ValueError("Invalid meeting app selection")
+    destination = expand_path(output)
+    destination.mkdir(parents=True, exist_ok=True)
+    if not destination.is_dir():
+        raise ValueError("Meeting folder is not a directory")
+    config = load_config()
+    config.update({
+        "configured": True,
+        "outputDirectory": str(destination),
+        "sttModel": stt_model,
+        "summaryModel": summary_model,
+        "language": language,
+        "saveAudio": save_audio == "true",
+        "autoSummarize": auto_summarize == "true" and summary_model != "disabled",
+        "detectMeetings": detect_meetings == "true",
+        "detectionApps": detection_apps,
+        "customMeetingApps": ", ".join(part.strip() for part in custom_apps.split(",") if part.strip()),
+    })
+    save_config(config)
+    apply_voxtype_config(config)
+    restart_voxtype()
+    print(json.dumps(config, ensure_ascii=False))
+
+
+def installed_stt(model: str) -> bool:
+    return (VOXTYPE_MODELS / f"ggml-{model}.bin").exists()
+
+
+def ensure_ollama_service() -> None:
+    if not command_exists(OLLAMA):
+        raise RuntimeError("Ollama is not installed")
+    if not command_exists(SYSTEMCTL):
+        raise RuntimeError("systemd user services are unavailable")
+    executable = shutil.which(OLLAMA) or OLLAMA
+    content = f"""[Unit]
+Description=Local Ollama for Omarchy Local Meeting
+After=network-online.target
+
+[Service]
+ExecStart={executable} serve
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"""
+    OLLAMA_SERVICE.parent.mkdir(parents=True, exist_ok=True)
+    if not OLLAMA_SERVICE.exists() or OLLAMA_SERVICE.read_text(encoding="utf-8") != content:
+        OLLAMA_SERVICE.write_text(content, encoding="utf-8")
+        run([SYSTEMCTL, "--user", "daemon-reload"], timeout=20)
+    result = run(
+        [SYSTEMCTL, "--user", "enable", "--now", OLLAMA_SERVICE.name],
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Could not start local Ollama").strip())
+    for _ in range(50):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1):
+                return
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.1)
+    raise RuntimeError("Local Ollama did not become ready")
+
+
+def ollama_models() -> list[str]:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1) as response:
+            payload = json.load(response)
+        return [str(item.get("name", "")) for item in payload.get("models", [])]
+    except (OSError, ValueError, urllib.error.URLError):
+        return []
+
+
+def installed_ollama(model: str) -> bool:
+    if model == "disabled":
+        return True
+    names = ollama_models()
+    base = model if ":" in model else model + ":latest"
+    return model in names or base in names or model + ":latest" in names
+
+
+def download_stt(model: str) -> None:
+    if model not in STT_MODELS:
+        raise ValueError("Unsupported speech model")
+    run(
+        [VOXTYPE, "setup", "--download", "--model", model, "--no-post-install"],
+        timeout=None,
+    )
+    run([VOXTYPE, "setup", "model", "--set", model, "--restart"], timeout=60)
+    config = load_config()
+    config["sttModel"] = model
+    save_config(config)
+    apply_voxtype_config(config)
+    restart_voxtype()
+    print(f"Speech model {model} is ready")
+
+
+def download_summary(model: str) -> None:
+    if model not in SUMMARY_MODELS or model == "disabled" or "cloud" in model.lower():
+        raise ValueError("Unsupported local summary model")
+    ensure_ollama_service()
+    process = subprocess.run([OLLAMA, "pull", model], text=True, timeout=None)
+    if process.returncode != 0:
+        raise RuntimeError(f"Could not download {model}")
+    config = load_config()
+    config["summaryModel"] = model
+    save_config(config)
+    apply_voxtype_config(config)
+    print(f"Summary model {model} is ready")
+
+
+def runtime_meeting() -> tuple[str, str]:
+    try:
+        lines = RUNTIME_STATE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "idle", ""
+    status = lines[0].strip() if lines else "idle"
+    meeting_id = lines[1].strip() if len(lines) > 1 else ""
+    return status if status in {"recording", "paused"} else "idle", meeting_id
+
+
+def wait_for_state(expected: set[str], timeout: float) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout
+    last = runtime_meeting()
+    while time.monotonic() < deadline:
+        last = runtime_meeting()
+        if last[0] in expected:
+            return last
+        time.sleep(0.1)
+    return last
+
+
+def slugify(title: str) -> str:
+    value = re.sub(r"[^\w]+", "-", clean(title).lower(), flags=re.UNICODE).strip("-")
+    return value[:60].rstrip("-") or "meeting"
+
+
+def active_data() -> dict:
+    value = read_json(ACTIVE_PATH, {})
+    return value if isinstance(value, dict) else {}
+
+
+def write_note(author: str, note: str) -> None:
+    note = clean(note)
+    author = clean(author) or "Me"
+    if not note:
+        raise ValueError("Note text is required")
+    active = active_data()
+    if not active:
+        raise RuntimeError("No active meeting")
+    entry = {"timestamp": now_iso(), "author": author, "note": note}
+    path = Path(active["session_dir"]) / "manual-notes.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(json.dumps(entry, ensure_ascii=False))
+
+
+def read_notes(active_or_dir: dict | Path, limit: int = 0) -> list[dict]:
+    directory = Path(active_or_dir["session_dir"]) if isinstance(active_or_dir, dict) else active_or_dir
+    path = directory / "manual-notes.jsonl"
+    notes: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            value = json.loads(line)
+            if isinstance(value, dict):
+                moment = datetime.fromisoformat(value["timestamp"])
+                value["time"] = moment.strftime("%H:%M")
+                notes.append(value)
+        except (ValueError, TypeError, KeyError):
+            continue
+    return notes[-limit:][::-1] if limit else notes
+
+
+def pulse_sources() -> tuple[str, str | None]:
+    microphone = "default"
+    monitor = None
+    try:
+        default = run([PACTL, "get-default-source"], timeout=5).stdout.strip()
+        if default:
+            microphone = default
+        sources = run([PACTL, "list", "short", "sources"], timeout=5).stdout.splitlines()
+        monitors = []
+        for line in sources:
+            fields = line.split("\t")
+            if len(fields) >= 2 and ".monitor" in fields[1]:
+                monitors.append((fields[1], fields[4] if len(fields) >= 5 else ""))
+        running = next((name for name, status in monitors if status == "RUNNING"), None)
+        monitor = running or (monitors[0][0] if monitors else None)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return microphone, monitor
+
+
+def start_audio_recording(active: dict) -> None:
+    microphone, monitor = pulse_sources()
+    output = Path(active["session_dir"]) / "recording.ogg"
+    command = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "warning", "-y"]
+    command += ["-f", "pulse", "-i", microphone]
+    if monitor:
+        command += ["-f", "pulse", "-i", monitor]
+        command += [
+            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0[a]",
+            "-map", "[a]",
+        ]
+    else:
+        command += ["-map", "0:a"]
+    command += ["-c:a", "libopus", "-b:a", "64k", str(output)]
+    log = (Path(active["session_dir"]) / "recording.log").open("ab")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
+    time.sleep(0.35)
+    if process.poll() is not None:
+        raise RuntimeError("Audio recording could not start; see recording.log")
+    active["audio_pid"] = process.pid
+    active["audio_path"] = str(output)
+    atomic_json(ACTIVE_PATH, active)
+
+
+def stop_audio_recording(active: dict) -> None:
+    pid = int(active.get("audio_pid", 0) or 0)
+    if pid <= 0:
+        return
+    try:
+        os.killpg(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def start_meeting(title: str) -> None:
+    config = load_config()
+    if not config.get("configured"):
+        raise RuntimeError("Complete setup first")
+    if not installed_stt(config.get("sttModel", "small")):
+        raise RuntimeError("Download the selected multilingual speech model in Setup first")
+    if runtime_meeting()[0] != "idle":
+        raise RuntimeError("A meeting is already active")
+    title = clean(title) or datetime.now().strftime("Meeting %Y-%m-%d %H:%M")
+    destination = expand_path(config["outputDirectory"])
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    session_dir = destination / f"{stamp}-{slugify(title)}"
+    session_dir.mkdir(parents=True, exist_ok=False)
+    active = {
+        "title": title,
+        "started_at": now_iso(),
+        "started_epoch": int(time.time()),
+        "session_dir": str(session_dir),
+        "meeting_id": "",
+    }
+    atomic_json(ACTIVE_PATH, active)
+    result = run([VOXTYPE, "meeting", "start", "--title", title, "--diarization", "simple"], check=False)
+    if result.returncode != 0:
+        ACTIVE_PATH.unlink(missing_ok=True)
+        raise RuntimeError((result.stderr or result.stdout or "Could not start meeting").strip())
+    status, meeting_id = wait_for_state({"recording"}, 8)
+    if status != "recording" or not meeting_id:
+        ACTIVE_PATH.unlink(missing_ok=True)
+        raise RuntimeError("Voxtype did not start meeting capture")
+    active["meeting_id"] = meeting_id
+    atomic_json(ACTIVE_PATH, active)
+    warning = ""
+    if config.get("saveAudio"):
+        try:
+            start_audio_recording(active)
+        except Exception as error:
+            warning = str(error)
+            active["audio_error"] = warning
+            atomic_json(ACTIVE_PATH, active)
+    print(json.dumps({"meeting_id": meeting_id, "session_dir": str(session_dir), "warning": warning}, ensure_ascii=False))
+
+
+def meeting_show(meeting_id: str) -> dict:
+    if not meeting_id:
+        return {}
+    result = run([VOXTYPE, "meeting", "show", meeting_id], check=False, timeout=15)
+    if result.returncode != 0:
+        return {}
+    info: dict[str, object] = {}
+    lines = result.stdout.splitlines()
+    if lines:
+        info["title"] = lines[0].strip()
+    for line in lines:
+        match = re.match(r"^(Started|Ended|Duration|Status|Chunks|Segments|Words|Speakers):\s+(.*)$", line.strip())
+        if match:
+            key = match.group(1).lower()
+            value: object = match.group(2).strip()
+            if key in {"chunks", "segments", "words"}:
+                try:
+                    value = int(str(value))
+                except ValueError:
+                    pass
+            info[key] = value
+    return info
+
+
+def ollama_generate(model: str, prompt: str) -> str:
+    if "cloud" in model.lower():
+        raise RuntimeError("Cloud models are blocked")
+    ensure_ollama_service()
+    body = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_ctx": 32768},
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=600) as response:
+        payload = json.load(response)
+    text = str(payload.get("response", "")).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if not text:
+        raise RuntimeError("The local summary model returned no text")
+    return text
+
+
+def manual_notes_markdown(notes: list[dict]) -> str:
+    if not notes:
+        return "## Manual notes\n\n_No manual notes were added._\n"
+    lines = ["## Manual notes", ""]
+    for note in notes:
+        moment = datetime.fromisoformat(note["timestamp"]).strftime("%H:%M")
+        lines.append(f"- **{moment} — {clean(note.get('author'))}:** {clean(note.get('note'))}")
+    return "\n".join(lines) + "\n"
+
+
+def strip_export_header(markdown: str) -> str:
+    lines = markdown.splitlines()
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip() + "\n"
+
+
+def finish_document(active: dict, summary: str, transcript: str, info: dict) -> Path:
+    directory = Path(active["session_dir"])
+    notes = read_notes(directory)
+    title = clean(active.get("title")) or "Meeting"
+    started = active.get("started_at", now_iso())
+    config = load_config()
+    audio_path = directory / "recording.ogg"
+    frontmatter = [
+        "---",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        f"date: {json.dumps(started)}",
+        "type: meeting",
+        "tags: [meeting]",
+        f"transcription_model: {json.dumps(config.get('sttModel', ''))}",
+        f"summary_model: {json.dumps(config.get('summaryModel', 'disabled'))}",
+        f"audio_saved: {'true' if audio_path.exists() else 'false'}",
+        "---",
+        "",
+        f"# {title}",
+        "",
+    ]
+    links = ["## Files", "", "- [Structured transcript](transcript.json)"]
+    if audio_path.exists():
+        links.append("- [Audio recording](recording.ogg)")
+    sections = ["\n".join(frontmatter)]
+    if summary:
+        sections.append(summary.strip() + "\n")
+    sections.append(manual_notes_markdown(notes))
+    sections.append("\n".join(links) + "\n")
+    sections.append(strip_export_header(transcript))
+    output = directory / "meeting.md"
+    output.write_text("\n".join(part.rstrip() for part in sections).rstrip() + "\n", encoding="utf-8")
+    return output
+
+
+def stop_meeting() -> None:
+    active = active_data()
+    if not active:
+        raise RuntimeError("No active meeting")
+    stop_audio_recording(active)
+    result = run([VOXTYPE, "meeting", "stop"], check=False, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "Could not stop meeting").strip())
+    status, _ = wait_for_state({"idle"}, 90)
+    if status != "idle":
+        raise RuntimeError("Voxtype is still finishing the meeting")
+
+    meeting_id = clean(active.get("meeting_id")) or "latest"
+    directory = Path(active["session_dir"])
+    transcript_md = directory / ".transcript.md"
+    transcript_json = directory / "transcript.json"
+    export_base = [VOXTYPE, "meeting", "export", meeting_id]
+    run(export_base + ["--format", "markdown", "--timestamps", "--speakers", "--metadata", "--output", str(transcript_md)], timeout=90)
+    run(export_base + ["--format", "json", "--timestamps", "--speakers", "--metadata", "--output", str(transcript_json)], timeout=90)
+    transcript = transcript_md.read_text(encoding="utf-8")
+    info = meeting_show(meeting_id)
+
+    config = load_config()
+    summary = ""
+    summary_error = ""
+    model = config.get("summaryModel", "disabled")
+    if config.get("autoSummarize") and model != "disabled":
+        notes = manual_notes_markdown(read_notes(directory))
+        source = transcript[-120000:]
+        prompt = f"""You are producing accurate meeting notes from a transcript.
+Use the same primary language as the transcript, including Danish when the meeting is Danish.
+Return only standard Markdown with these exact second-level headings:
+## Summary
+## Key points
+## Decisions
+## Action items
+Use concise bullets. Action items must use Markdown checkboxes. Include an assignee only when explicit.
+Treat manual notes as important signals. Do not invent facts, decisions, deadlines, or owners.
+
+{notes}
+
+{source}
+"""
+        try:
+            ensure_ollama_service()
+            if not installed_ollama(model):
+                raise RuntimeError(f"Local summary model {model} is not downloaded")
+            summary = ollama_generate(model, prompt)
+        except Exception as error:
+            summary_error = str(error)
+
+    output = finish_document(active, summary, transcript, info)
+    transcript_md.unlink(missing_ok=True)
+    completed = dict(active)
+    completed.update({
+        "ended_at": now_iso(),
+        "meeting_path": str(output),
+        "summary_error": summary_error,
+    })
+    atomic_json(LAST_PATH, completed)
+    ACTIVE_PATH.unlink(missing_ok=True)
+    print(json.dumps(completed, ensure_ascii=False))
+
+
+def control(action: str) -> None:
+    if action not in {"pause", "resume"}:
+        raise ValueError("Unsupported control")
+    result = run([VOXTYPE, "meeting", action], check=False, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or f"Could not {action} meeting").strip())
+    expected = {"paused"} if action == "pause" else {"recording"}
+    status, meeting_id = wait_for_state(expected, 8)
+    if status not in expected:
+        raise RuntimeError(f"Meeting did not {action}")
+    print(json.dumps({"status": status, "meeting_id": meeting_id}))
+
+
+def open_target() -> None:
+    active = active_data()
+    last = read_json(LAST_PATH, {})
+    if active:
+        target = Path(active["session_dir"])
+    elif isinstance(last, dict) and last.get("meeting_path"):
+        target = Path(last["meeting_path"])
+    else:
+        target = expand_path(load_config()["outputDirectory"])
+    attempts = []
+    if target.is_file() and shutil.which("omawrite"):
+        attempts.append(["omawrite", str(target)])
+    if target.is_file() and shutil.which("omarchy-launch-editor"):
+        attempts.append(["omarchy-launch-editor", str(target)])
+    attempts.append(["xdg-open", str(target if target.exists() else target.parent)])
+    for command in attempts:
+        try:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            print(target)
+            return
+        except OSError:
+            continue
+    raise RuntimeError("No application is available to open the meeting")
+
+
+def setup_state() -> None:
+    config = load_config()
+    models = ollama_models()
+    selected_summary = config.get("summaryModel", "qwen3.5:2b")
+    print(json.dumps({
+        "config": config,
+        "requirements": {
+            "voxtype": command_exists(VOXTYPE),
+            "ollama": command_exists(OLLAMA),
+            "ffmpeg": command_exists(FFMPEG),
+            "pactl": command_exists(PACTL),
+        },
+        "stt_ready": installed_stt(config.get("sttModel", "small")),
+        "summary_ready": selected_summary == "disabled" or installed_ollama(selected_summary),
+        "ollama_running": bool(models),
+        "ollama_models": models,
+        "stt_choices": STT_MODELS,
+        "summary_choices": SUMMARY_MODELS,
+    }, ensure_ascii=False))
+
+
+def state() -> None:
+    config = load_config()
+    status, runtime_id = runtime_meeting()
+    active = active_data()
+    last = read_json(LAST_PATH, {})
+    meeting_id = runtime_id or clean(active.get("meeting_id"))
+    details = meeting_show(meeting_id) if status != "idle" and meeting_id else {}
+    started_epoch = int(active.get("started_epoch", 0) or 0)
+    elapsed = max(0, int(time.time()) - started_epoch) if started_epoch and status != "idle" else 0
+    print(json.dumps({
+        "configured": bool(config.get("configured")),
+        "meeting_status": status,
+        "meeting_id": meeting_id,
+        "title": clean(active.get("title")) or clean(details.get("title")) or "Local Meeting",
+        "elapsed_seconds": elapsed,
+        "chunks": int(details.get("chunks", 0) or 0),
+        "session_dir": active.get("session_dir", ""),
+        "recent_notes": read_notes(active, 5) if active else [],
+        "output_directory": config.get("outputDirectory", str(DEFAULT_OUTPUT)),
+        "last_meeting_path": last.get("meeting_path", "") if isinstance(last, dict) else "",
+        "settings": config,
+        "audio_warning": active.get("audio_error", ""),
+    }, ensure_ascii=False))
+
+
+def microphone_clients() -> list[dict]:
+    """Return active microphone consumers from PipeWire's PulseAudio view."""
+    result = run([PACTL, "--format=json", "list", "source-outputs"], check=False, timeout=8)
+    if result.returncode != 0:
+        return []
+    try:
+        items = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    clients = []
+    for item in items if isinstance(items, list) else []:
+        if item.get("mute") is True or item.get("corked") is True:
+            continue
+        properties = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+        haystack = " ".join(str(value) for value in properties.values()).lower()
+        if any(token in haystack for token in ("voxtype", "local-meeting", "ffmpeg")):
+            continue
+        clients.append({"properties": properties, "haystack": haystack})
+    return clients
+
+
+def meeting_windows() -> str:
+    if not command_exists(HYPRCTL):
+        return ""
+    result = run([HYPRCTL, "clients", "-j"], check=False, timeout=8)
+    if result.returncode != 0:
+        return ""
+    try:
+        clients = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return ""
+    values = []
+    for item in clients if isinstance(clients, list) else []:
+        if not isinstance(item, dict):
+            continue
+        values.extend([item.get("class", ""), item.get("initialClass", ""),
+                       item.get("title", ""), item.get("initialTitle", "")])
+    return " ".join(str(value) for value in values).lower()
+
+
+def detect_meeting_app(config: dict) -> str:
+    clients = microphone_clients()
+    if not clients:
+        return ""
+    enabled = set(config.get("detectionApps", default_config()["detectionApps"]))
+    direct_apps = [
+        ("zoom", "zoom", "Zoom"),
+        ("teams", "microsoft teams", "Microsoft Teams"),
+        ("teams", "teams", "Microsoft Teams"),
+        ("discord", "discord", "Discord"),
+        ("discord", "vesktop", "Discord / Vesktop"),
+        ("discord", "webcord", "Discord / WebCord"),
+        ("slack", "slack", "Slack"),
+        ("buzz", "buzz", "Buzz"),
+        ("webex", "webex", "Webex"),
+        ("jitsi", "jitsi", "Jitsi"),
+    ]
+    for client in clients:
+        for app_id, token, label in direct_apps:
+            if app_id in enabled and token in client["haystack"]:
+                return label
+
+    windows = meeting_windows()
+    window_apps = [
+        ("meet", "meet.google", "Google Meet"),
+        ("meet", "google meet", "Google Meet"),
+        ("slack", "slack huddle", "Slack Huddle"),
+        ("teams", "microsoft teams", "Microsoft Teams"),
+        ("zoom", "zoom meeting", "Zoom"),
+        ("discord", "discord", "Discord"),
+        ("browser", "whereby", "Whereby"),
+        ("jitsi", "jitsi meet", "Jitsi"),
+    ]
+    for app_id, token, label in window_apps:
+        if app_id in enabled and token in windows:
+            return label
+
+    browser_tokens = ("chromium", "chrome", "brave", "firefox", "zen", "vivaldi", "edge")
+    if "browser" in enabled and any(any(token in client["haystack"] for token in browser_tokens) for client in clients):
+        return "Browser call"
+
+    custom_tokens = [part.strip().lower() for part in str(config.get("customMeetingApps", "")).split(",") if part.strip()]
+    combined = windows + " " + " ".join(client["haystack"] for client in clients)
+    for token in custom_tokens:
+        if token in combined:
+            return token
+    return ""
+
+
+def detect() -> None:
+    config = load_config()
+    if not config.get("configured") or not config.get("detectMeetings", True):
+        print(json.dumps({"detected": False}))
+        return
+    if runtime_meeting()[0] != "idle":
+        print(json.dumps({"detected": False, "reason": "already-recording"}))
+        return
+    app = detect_meeting_app(config)
+    detection_path = DATA_DIR / "detection.json"
+    state_value = read_json(detection_path, {})
+    detection = state_value if isinstance(state_value, dict) else {}
+    now = int(time.time())
+    if not app:
+        if detection.get("candidate"):
+            atomic_json(detection_path, {"candidate": "", "count": 0, "last_notified": detection.get("last_notified", 0)})
+        print(json.dumps({"detected": False}))
+        return
+
+    count = int(detection.get("count", 0)) + 1 if detection.get("candidate") == app else 1
+    last_notified = int(detection.get("last_notified", 0) or 0)
+    detection.update({"candidate": app, "count": count})
+    atomic_json(detection_path, detection)
+    if count < 2 or now - last_notified < 1800:
+        print(json.dumps({"detected": True, "app": app, "notified": False}))
+        return
+
+    detection["last_notified"] = now
+    atomic_json(detection_path, detection)
+    action = ""
+    if command_exists(NOTIFY_SEND):
+        result = run([
+            NOTIFY_SEND,
+            "--app-name=Local Meeting",
+            "--icon=audio-input-microphone",
+            "--urgency=normal",
+            "--expire-time=15000",
+            "--action=open=Open Local Meeting",
+            "--action=dismiss=Not now",
+            "Meeting detected",
+            f"{app} is using your microphone. Start local recording and notes?",
+        ], check=False, timeout=60)
+        action = result.stdout.strip()
+    if action == "open" and command_exists(OMARCHY_SHELL):
+        run([OMARCHY_SHELL, "-q", "io.github.gustavonline.local-meeting", "toggle"], check=False, timeout=10)
+    print(json.dumps({"detected": True, "app": app, "notified": True, "action": action}))
+
+
+def main() -> None:
+    os.umask(0o077)
+    command = sys.argv[1] if len(sys.argv) > 1 else "state"
+    if command == "state":
+        state()
+    elif command == "setup-state":
+        setup_state()
+    elif command == "configure":
+        if len(sys.argv) != 11:
+            raise ValueError("Usage: local-meeting configure DIR STT SUMMARY LANGUAGE SAVE_AUDIO AUTO_SUMMARIZE DETECT APPS CUSTOM")
+        configure(*sys.argv[2:11])
+    elif command == "download-stt":
+        download_stt(sys.argv[2])
+    elif command == "download-summary":
+        download_summary(sys.argv[2])
+    elif command == "start":
+        start_meeting(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif command in {"pause", "resume"}:
+        control(command)
+    elif command == "stop":
+        stop_meeting()
+    elif command == "add-note":
+        if len(sys.argv) != 4:
+            raise ValueError("Usage: local-meeting add-note AUTHOR NOTE")
+        write_note(sys.argv[2], sys.argv[3])
+    elif command == "open":
+        open_target()
+    elif command == "detect":
+        detect()
+    else:
+        raise ValueError(f"Unknown command: {command}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1)
