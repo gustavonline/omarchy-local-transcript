@@ -605,6 +605,7 @@ def ollama_generate(model: str, prompt: str) -> str:
         payload = json.load(response)
     text = str(payload.get("response", "")).strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"(?m)^(\s*[-*])\s*\[\s*\]\s*", r"\1 [ ] ", text)
     if not text:
         raise RuntimeError("The local summary model returned no text")
     return text
@@ -626,7 +627,9 @@ def strip_export_header(markdown: str) -> str:
         lines = lines[1:]
         while lines and not lines[0].strip():
             lines.pop(0)
-    return "\n".join(lines).strip() + "\n"
+    body = "\n".join(lines).strip()
+    body = body.replace("## Meeting Info", "## Recording info")
+    return body + "\n"
 
 
 def finish_document(active: dict, summary: str, transcript: str, info: dict) -> Path:
@@ -660,7 +663,7 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
     sections.append("\n".join(links) + "\n")
     sections.append(strip_export_header(transcript))
     output = directory / "transcript.md"
-    output.write_text("\n".join(part.rstrip() for part in sections).rstrip() + "\n", encoding="utf-8")
+    output.write_text("\n\n".join(part.rstrip() for part in sections).rstrip() + "\n", encoding="utf-8")
     return output
 
 
@@ -694,7 +697,7 @@ def stop_meeting() -> None:
         notes = manual_notes_markdown(read_notes(directory))
         source = transcript[-120000:]
         prompt = f"""This is a transcript of a meeting, interview, lecture, video, podcast, or other spoken content.
-Detect the transcript's primary language and write the result in that same language.
+Detect the transcript's primary language and write the result in that same language. For mixed audio, use the language of the most meaningful spoken content and ignore repetitive ads or background phrases.
 Use speaker/source labels as evidence, but never invent speaker identities. "You" means microphone input and "Remote" means computer audio; multiple people may share the Remote label.
 Return only standard Markdown with these exact second-level headings, translated naturally when appropriate:
 ## Summary
@@ -702,7 +705,7 @@ Return only standard Markdown with these exact second-level headings, translated
 ## Decisions
 ## Action items
 Use a short paragraph for the summary and concise bullets elsewhere. Action items must use Markdown checkboxes.
-For non-meeting content, state that decisions or action items were not present instead of inventing them.
+For non-meeting content, state that decisions or action items were not present instead of inventing them. When there are no action items, write an italicized sentence rather than an empty checkbox.
 Treat manual annotations as important signals. Do not invent facts, identities, decisions, deadlines, or owners.
 
 {notes}

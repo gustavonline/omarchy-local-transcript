@@ -78,7 +78,7 @@ class BackendTests(unittest.TestCase):
         output = self.module.finish_document(
             active,
             "## Summary\n\nKort dansk resumé.",
-            "# Dansk video\n\n## Transcript\n\n*[00:01]* Remote: Hej.\n",
+            "# Dansk video\n\n## Meeting Info\n\n- **Duration:** 1m\n\n## Transcript\n\n*[00:01]* Remote: Hej.\n",
             {},
         )
         text = output.read_text(encoding="utf-8")
@@ -87,6 +87,8 @@ class BackendTests(unittest.TestCase):
         self.assertIn("## Manual annotations", text)
         self.assertIn("- **14:31 — Me:** Vigtig pointe", text)
         self.assertIn("[Structured transcript](transcript.json)", text)
+        self.assertIn("## Recording info", text)
+        self.assertNotIn("## Meeting Info", text)
         self.assertEqual(text.count("# Dansk video"), 1)
 
     def test_installed_desktop_apps_are_exposed_as_picker_options(self):
