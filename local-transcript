@@ -404,7 +404,24 @@ def wait_for_state(expected: set[str], timeout: float) -> tuple[str, str]:
 
 def slugify(title: str) -> str:
     value = re.sub(r"[^\w]+", "-", clean(title).lower(), flags=re.UNICODE).strip("-")
-    return value[:60].rstrip("-") or "meeting"
+    return value[:60].rstrip("-") or "transcript"
+
+
+def recording_identity(title: str, sources: list[str], started: datetime) -> tuple[str, str]:
+    """Return a human title and stable date/time-prefixed filename stem."""
+    explicit_title = clean(title)
+    clean_sources = list(dict.fromkeys(clean(source) for source in sources if clean(source)))[:4]
+    if explicit_title:
+        display_title = explicit_title
+        subject = slugify(explicit_title)
+    elif clean_sources:
+        display_title = " + ".join(clean_sources)
+        subject = "-".join(slugify(source) for source in clean_sources)
+    else:
+        display_title = started.strftime("Transcript %Y-%m-%d %H:%M")
+        subject = "transcript"
+    timestamp = started.strftime("%Y-%m-%d-%H%M%S")
+    return display_title, f"{timestamp}-{subject[:80].rstrip('-')}"
 
 
 def active_data() -> dict:
@@ -526,14 +543,22 @@ def start_meeting(title: str) -> None:
         raise RuntimeError("Download the selected multilingual speech model in Setup first")
     if runtime_meeting()[0] != "idle":
         raise RuntimeError("A meeting is already active")
-    title = clean(title) or datetime.now().strftime("Transcript %Y-%m-%d %H:%M")
+    started = datetime.now().astimezone()
+    sources = active_source_apps(config)
+    title, file_stem = recording_identity(title, sources, started)
     destination = expand_path(config["outputDirectory"])
-    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    session_dir = destination / f"{stamp}-{slugify(title)}"
+    session_dir = destination / file_stem
+    suffix = 2
+    while session_dir.exists():
+        session_dir = destination / f"{file_stem}-{suffix}"
+        suffix += 1
+    file_stem = session_dir.name
     session_dir.mkdir(parents=True, exist_ok=False)
     active = {
         "title": title,
-        "started_at": now_iso(),
+        "sources": sources,
+        "file_stem": file_stem,
+        "started_at": started.isoformat(timespec="seconds"),
         "started_epoch": int(time.time()),
         "session_dir": str(session_dir),
         "meeting_id": "",
@@ -636,6 +661,9 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
     directory = Path(active["session_dir"])
     notes = read_notes(directory)
     title = clean(active.get("title")) or "Meeting"
+    sources = [clean(value) for value in active.get("sources", []) if clean(value)]
+    raw_file_stem = clean(active.get("file_stem")) or directory.name
+    file_stem = re.sub(r"[^\w.-]+", "-", raw_file_stem, flags=re.UNICODE).strip(".-")[:120] or "transcript"
     started = active.get("started_at", now_iso())
     config = load_config()
     audio_path = directory / "recording.ogg"
@@ -645,6 +673,7 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
         f"date: {json.dumps(started)}",
         "type: transcript",
         "tags: [transcript]",
+        f"sources: {json.dumps(sources, ensure_ascii=False)}",
         f"transcription_model: {json.dumps(config.get('sttModel', ''))}",
         f"summary_model: {json.dumps(config.get('summaryModel', 'disabled'))}",
         f"audio_saved: {'true' if audio_path.exists() else 'false'}",
@@ -662,7 +691,7 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
     sections.append(manual_notes_markdown(notes))
     sections.append("\n".join(links) + "\n")
     sections.append(strip_export_header(transcript))
-    output = directory / "transcript.md"
+    output = directory / f"{file_stem}.md"
     output.write_text("\n\n".join(part.rstrip() for part in sections).rstrip() + "\n", encoding="utf-8")
     return output
 
@@ -747,29 +776,15 @@ def control(action: str) -> None:
 
 
 def open_target() -> None:
-    active = active_data()
-    last = read_json(LAST_PATH, {})
-    if active:
-        target = Path(active["session_dir"])
-    elif isinstance(last, dict) and last.get("meeting_path"):
-        target = Path(last["meeting_path"])
-    else:
-        target = expand_path(load_config()["outputDirectory"])
-    attempts = []
-    if target.is_file() and shutil.which("omawrite"):
-        attempts.append(["omawrite", str(target)])
-    if target.is_file() and shutil.which("omarchy-launch-editor"):
-        attempts.append(["omarchy-launch-editor", str(target)])
-    attempts.append(["xdg-open", str(target if target.exists() else target.parent)])
-    for command in attempts:
-        try:
-            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-            print(target)
-            return
-        except OSError:
-            continue
-    raise RuntimeError("No application is available to open the meeting")
+    target = expand_path(load_config()["outputDirectory"])
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(["xdg-open", str(target)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as error:
+        raise RuntimeError("No file manager is available to open the transcript folder") from error
+    print(target)
 
 
 def setup_state() -> None:
@@ -945,26 +960,52 @@ def application_windows() -> list[str]:
     return windows
 
 
-def detect_source_app(config: dict) -> str:
+def source_app_matches(app: dict, haystack: str) -> bool:
+    generic_tokens = {
+        "application", "audio", "browser", "chromium", "chrome", "electron",
+        "firefox", "playback", "python", "runtime", "webapp",
+    }
+    tokens = [token for token in app.get("tokens", [])
+              if token not in generic_tokens and len(token) >= 3]
+    return any(token in haystack for token in tokens)
+
+
+def source_app_labels(config: dict, *, selected_only: bool) -> list[str]:
     selected = set(config.get("sourceApps", []))
-    if not selected:
-        return ""
-    apps = [app for app in installed_apps() if app["value"] in selected]
-    if not apps:
-        return ""
+    apps = installed_apps()
+    candidates = [app for app in apps if not selected_only or app["value"] in selected]
+    if not candidates:
+        return []
     recording = audio_clients("recording")
     playback = audio_clients("playback")
     clients = recording + playback
-    for app in apps:
-        if any(any(token in client["haystack"] for token in app["tokens"]) for client in clients):
-            return app["label"]
     if not clients:
-        return ""
+        return []
+
+    direct = [app for app in candidates
+              if any(source_app_matches(app, client["haystack"]) for client in clients)]
     windows = application_windows()
-    for app in apps:
-        if any(any(token in window for token in app["tokens"]) for window in windows):
-            return app["label"]
-    return ""
+    contextual = [app for app in apps if app["value"] in selected
+                  and any(source_app_matches(app, window) for window in windows)]
+
+    # A selected web app (for example YouTube) is more meaningful than the
+    # generic browser process carrying its audio stream.
+    browser_markers = {"zen", "firefox", "chromium", "google-chrome", "brave"}
+    if contextual:
+        direct = [app for app in direct if app["value"].casefold() not in browser_markers
+                  and "browser" not in app["label"].casefold()]
+
+    labels = {clean(app["label"]) for app in [*contextual, *direct] if clean(app["label"])}
+    return sorted(labels, key=str.casefold)[:4]
+
+
+def active_source_apps(config: dict) -> list[str]:
+    return source_app_labels(config, selected_only=False)
+
+
+def detect_source_app(config: dict) -> str:
+    labels = source_app_labels(config, selected_only=True)
+    return labels[0] if labels else ""
 
 
 def detect() -> None:

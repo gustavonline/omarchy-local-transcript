@@ -46,8 +46,13 @@ omarchy plugin add /path/to/omarchy-local-transcript --enable --yes
 ```
 
 Open the document icon in the bar. The main panel is intentionally limited to
-title, start/stop, pause, quick annotations, and opening the latest transcript.
+title, start/stop, pause, quick annotations, and opening the transcript folder.
 Use the cog button for storage, model downloads, audio retention, and reminders.
+
+The title is optional. If it is blank, Local Transcript uses active local audio
+metadata and selected web-app window context to produce a useful title such as
+`YouTube` or `Spotify + Zoom`. A manually entered title always takes priority.
+When an app cannot be identified reliably, the neutral name `Transcript` is used.
 
 ## App-aware reminders
 
@@ -71,7 +76,7 @@ Each recording gets a portable folder:
 ```text
 Transcripts/
   2026-08-19-143000-video-title/
-    transcript.md
+    2026-08-19-143000-video-title.md
     transcript.json
     manual-notes.jsonl
     recording.ogg       # optional
@@ -79,7 +84,9 @@ Transcripts/
 
 The main Markdown file contains YAML frontmatter, an optional summary, key points,
 decisions and checkbox actions, manual annotations, relative source-file links,
-and a timestamped speaker/source transcript.
+detected source names, and a timestamped speaker/source transcript. Both its
+folder and filename begin with local date and time; an explicit title or up to
+four detected audio sources form the remainder of the name.
 
 Voxtype's crash-resistant internal data is stored in the hidden `.voxtype-data`
 folder inside the selected output directory.

@@ -310,6 +310,7 @@ Panel {
         clip: true
         flickableDirection: Flickable.VerticalFlick
         boundsBehavior: Flickable.StopAtBounds
+        bottomMargin: Style.space(16)
 
         Column {
           id: contentColumn
@@ -380,7 +381,7 @@ Panel {
             TextField {
               id: titleField
               width: parent.width
-              placeholderText: "Title — meeting, video, podcast…"
+              placeholderText: "Optional title — otherwise detected"
               foreground: root.foreground
               accent: root.accent
               font.family: root.fontFamily
@@ -412,7 +413,7 @@ Panel {
 
             Button {
               width: parent.width
-              text: "Open latest transcript"
+              text: "Open transcripts"
               iconText: "↗"
               foreground: root.foreground
               accent: root.accent
@@ -559,6 +560,7 @@ Panel {
             }
 
             Button {
+              visible: !root.sttReady || (root.downloadBusy && root.downloadKind === "stt")
               width: parent.width
               text: root.downloadBusy && root.downloadKind === "stt" ? "Downloading speech model…"
                 : root.sttReady ? "Speech model installed" : "Download selected speech model"
@@ -570,6 +572,15 @@ Panel {
               bordered: true
               enabled: !root.downloadBusy && !root.sttReady
               onClicked: root.downloadModel("stt")
+            }
+
+            Text {
+              visible: root.sttReady && !(root.downloadBusy && root.downloadKind === "stt")
+              width: parent.width
+              text: "✓ Speech model installed locally"
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
 
             Dropdown {
@@ -590,6 +601,7 @@ Panel {
 
             Button {
               visible: root.selectedSummary !== "disabled"
+                && (!root.summaryReady || (root.downloadBusy && root.downloadKind === "summary"))
               width: parent.width
               text: root.downloadBusy && root.downloadKind === "summary" ? "Downloading summary model…"
                 : root.summaryReady ? "Summary model installed" : "Download selected summary model"
@@ -601,6 +613,16 @@ Panel {
               bordered: true
               enabled: !root.downloadBusy && !root.summaryReady
               onClicked: root.downloadModel("summary")
+            }
+
+            Text {
+              visible: root.selectedSummary !== "disabled" && root.summaryReady
+                && !(root.downloadBusy && root.downloadKind === "summary")
+              width: parent.width
+              text: "✓ Summary model installed locally"
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
 
             Toggle {
@@ -658,7 +680,7 @@ Panel {
             Text {
               visible: root.selectedDetection
               width: parent.width
-              text: "Select Zoom, Discord, Zen Browser, YouTube, or any other installed app. Leave an app unchecked to avoid reminders from it."
+              text: "Only checked apps can trigger reminders."
               color: Qt.darker(root.foreground, 1.45)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -667,7 +689,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Model downloads use the internet once. Transcription, summaries, audio and notes stay on this computer."
+              text: "Downloads use the internet once; recordings and notes stay local."
               color: Qt.darker(root.foreground, 1.45)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -686,6 +708,8 @@ Panel {
               enabled: !root.busy && !root.downloadBusy
               onClicked: root.saveSetup()
             }
+
+            Item { width: 1; height: Style.space(8) }
           }
 
           Text {

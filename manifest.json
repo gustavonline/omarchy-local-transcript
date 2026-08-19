@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.gustavonline.local-transcript",
   "name": "Local Transcript",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Gustav",
   "license": "MIT",
   "description": "Transcribe meetings, videos, podcasts, and computer audio entirely on your machine",

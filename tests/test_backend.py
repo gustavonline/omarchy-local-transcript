@@ -63,6 +63,8 @@ class BackendTests(unittest.TestCase):
         (session / "transcript.json").write_text("{}\n", encoding="utf-8")
         active = {
             "title": "Dansk video",
+            "sources": ["YouTube"],
+            "file_stem": "2026-08-19-143000-youtube",
             "started_at": "2026-08-19T14:30:00+02:00",
             "session_dir": str(session),
         }
@@ -82,14 +84,29 @@ class BackendTests(unittest.TestCase):
             {},
         )
         text = output.read_text(encoding="utf-8")
-        self.assertEqual(output.name, "transcript.md")
+        self.assertEqual(output.name, "2026-08-19-143000-youtube.md")
         self.assertIn("tags: [transcript]", text)
+        self.assertIn('sources: ["YouTube"]', text)
         self.assertIn("## Manual annotations", text)
         self.assertIn("- **14:31 — Me:** Vigtig pointe", text)
         self.assertIn("[Structured transcript](transcript.json)", text)
         self.assertIn("## Recording info", text)
         self.assertNotIn("## Meeting Info", text)
         self.assertEqual(text.count("# Dansk video"), 1)
+
+    def test_recording_name_prefers_title_then_multiple_sources(self):
+        started = self.module.datetime.fromisoformat("2026-08-19T14:30:45+02:00")
+        title, stem = self.module.recording_identity("Kundemøde Q3", ["Zoom", "YouTube"], started)
+        self.assertEqual(title, "Kundemøde Q3")
+        self.assertEqual(stem, "2026-08-19-143045-kundemøde-q3")
+
+        title, stem = self.module.recording_identity("", ["YouTube", "Zoom", "YouTube"], started)
+        self.assertEqual(title, "YouTube + Zoom")
+        self.assertEqual(stem, "2026-08-19-143045-youtube-zoom")
+
+        title, stem = self.module.recording_identity("", [], started)
+        self.assertEqual(title, "Transcript 2026-08-19 14:30")
+        self.assertEqual(stem, "2026-08-19-143045-transcript")
 
     def test_installed_desktop_apps_are_exposed_as_picker_options(self):
         app_dir = Path(self.temp.name) / "applications"
@@ -133,6 +150,22 @@ class BackendTests(unittest.TestCase):
         config = self.module.default_config()
         config["sourceApps"] = ["YouTube"]
         self.assertEqual(self.module.detect_source_app(config), "YouTube")
+
+    def test_web_app_replaces_browser_but_keeps_other_audio_sources(self):
+        self.module.installed_apps = lambda: [
+            {"value": "Spotify", "label": "Spotify", "description": "spotify", "tokens": ["spotify"]},
+            {"value": "YouTube", "label": "YouTube", "description": "youtube.com", "tokens": ["youtube"]},
+            {"value": "zen", "label": "Zen Browser", "description": "zen", "tokens": ["zen browser", "zen"]},
+        ]
+        self.module.audio_clients = lambda kind: (
+            [{"haystack": "zen browser playback", "properties": {}, "kind": kind},
+             {"haystack": "spotify audio", "properties": {}, "kind": kind}]
+            if kind == "playback" else []
+        )
+        self.module.application_windows = lambda: ["lecture - youtube — zen browser"]
+        config = self.module.default_config()
+        config["sourceApps"] = ["YouTube"]
+        self.assertEqual(self.module.active_source_apps(config), ["Spotify", "YouTube"])
 
 
 if __name__ == "__main__":

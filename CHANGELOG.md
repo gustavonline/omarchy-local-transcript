@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-08-19
+
+- Open the configured transcript folder directly from the main panel
+- Use date, time, an optional title, and detected active audio sources for names
+- Give the primary Markdown document the same meaningful name as its folder
+- Compact installed-model status rows and add breathing room below settings
+
 ## 0.2.0 — 2026-08-19
 
 - Renamed the plugin to Local Transcript and expanded it beyond meetings
