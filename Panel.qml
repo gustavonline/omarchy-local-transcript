@@ -536,7 +536,7 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            PanelSectionHeader { text: "FILES"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader { text: "TRANSCRIPT FOLDER"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             TextField {
               id: outputField
