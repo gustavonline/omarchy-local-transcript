@@ -1,14 +1,13 @@
 # Local Transcript for Omarchy
 
-Local Transcript is a local-first Omarchy bar widget for recording, transcribing,
+Local Transcript is an Omarchy bar widget for recording, transcribing,
 annotating, and summarizing meetings, videos, lectures, podcasts, and other
-spoken computer audio. Audio and inference stay on your computer. Network access
-is used only when you explicitly download a model.
+spoken computer audio.
 
 ## What it does
 
 - Captures computer audio and microphone input through PipeWire/PulseAudio
-- Uses Voxtype meeting mode for continuous multilingual speech-to-text
+- Uses Voxtype for continuous multilingual speech-to-text
 - Labels microphone audio as `You` and computer audio as `Remote`
 - Adds timestamped manual annotations while recording
 - Optionally saves a compressed `recording.ogg`
@@ -35,9 +34,8 @@ The optional summary uses Ollama:
 | `qwen3:1.7b` | 1.4 GB | Light summary option |
 | `qwen3:4b-instruct` | 2.5 GB | Recommended quality/size balance |
 
-Qwen thinking is disabled for this summarization task. The summary prompt detects
-the transcript language, writes in the same language, respects `You`/`Remote`
-source labels, and avoids inventing speaker identities or meeting decisions.
+The summary follows the transcript language, respects `You`/`Remote` source
+labels, and avoids inventing speaker identities, decisions, or action items.
 
 ## Install
 
@@ -45,12 +43,12 @@ source labels, and avoids inventing speaker identities or meeting decisions.
 omarchy plugin add /path/to/omarchy-local-transcript --enable --yes
 ```
 
-Open the document icon in the bar. The main panel is intentionally limited to
-title, start/stop, pause, quick annotations, and opening the transcript folder.
+Open the document icon in the bar. The main panel contains the transcript title,
+recording controls, quick annotations, and a shortcut to the transcript folder.
 Use the cog button for storage, model downloads, audio retention, and reminders.
 
-The title is optional. If it is blank, Local Transcript uses active local audio
-metadata and selected web-app window context to produce a useful title such as
+The transcript title is optional. If it is blank, Local Transcript uses active
+audio metadata and selected web-app window context to produce a useful title such as
 `YouTube` or `Spotify + Zoom`. A manually entered title always takes priority.
 When an app cannot be identified reliably, the neutral name `Transcript` is used.
 

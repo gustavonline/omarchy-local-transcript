@@ -30,6 +30,8 @@ Panel {
   property var selectedSourceApps: []
   property bool sttReady: false
   property bool summaryReady: false
+  property var installedSttModels: []
+  property var installedSummaryModels: []
   property var requirements: ({})
 
   readonly property string helperPath: Qt.resolvedUrl("local-transcript").toString().replace(/^file:\/\//, "")
@@ -39,14 +41,14 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property var sttOptions: [
-    { value: "base", label: "Whisper Base", description: "142 MB · fastest, lower accuracy" },
-    { value: "small", label: "Whisper Small", description: "466 MB · recommended multilingual balance" },
-    { value: "large-v3-turbo", label: "Whisper Large v3 Turbo", description: "1.6 GB · highest accuracy, heavier" }
+    { value: "base", label: "Whisper Base", description: "142 MB · Fastest" },
+    { value: "small", label: "Whisper Small", description: "466 MB · Recommended" },
+    { value: "large-v3-turbo", label: "Whisper Large v3 Turbo", description: "1.6 GB · Most accurate" }
   ]
   readonly property var summaryOptions: [
-    { value: "disabled", label: "No AI summary", description: "Transcript and Markdown only" },
-    { value: "qwen3:1.7b", label: "Qwen 3 1.7B", description: "1.4 GB · light" },
-    { value: "qwen3:4b-instruct", label: "Qwen 3 4B Instruct", description: "2.5 GB · recommended" }
+    { value: "disabled", label: "No summary", description: "Transcript only" },
+    { value: "qwen3:1.7b", label: "Qwen 3 1.7B", description: "1.4 GB · Faster" },
+    { value: "qwen3:4b-instruct", label: "Qwen 3 4B Instruct", description: "2.5 GB · Recommended" }
   ]
 
   function formatDuration(total) {
@@ -104,6 +106,8 @@ Panel {
       selectedSourceApps = Array.isArray(config.sourceApps) ? config.sourceApps : []
       sttReady = Boolean(data.stt_ready)
       summaryReady = Boolean(data.summary_ready)
+      installedSttModels = Array.isArray(data.installed_stt_models) ? data.installed_stt_models : []
+      installedSummaryModels = Array.isArray(data.ollama_models) ? data.ollama_models : []
       requirements = data.requirements || {}
     } catch (error) {
       statusMessage = "Could not read local settings"
@@ -139,7 +143,7 @@ Panel {
     if (downloadBusy || (kind === "summary" && selectedSummary === "disabled")) return
     downloadBusy = true
     downloadKind = kind
-    statusMessage = kind === "stt" ? "Downloading speech model…" : "Downloading local summary model…"
+    statusMessage = kind === "stt" ? "Downloading transcription model…" : "Downloading summary model…"
     statusIsError = false
     downloadProc.command = kind === "stt"
       ? [helperPath, "download-stt", selectedStt]
@@ -214,16 +218,16 @@ Panel {
     onExited: function(exitCode) {
       root.busy = false
       if (exitCode === 0) {
-        if (action === "start") root.statusMessage = "Local transcription started"
+        if (action === "start") root.statusMessage = "Recording started"
         else if (action === "pause") root.statusMessage = "Transcription paused"
         else if (action === "resume") root.statusMessage = "Transcription resumed"
-        else if (action === "stop") root.statusMessage = "Transcript and Markdown saved"
+        else if (action === "stop") root.statusMessage = "Transcript saved"
         else if (action === "add-note") {
           root.statusMessage = "Annotation saved"
           noteField.text = ""
           noteField.forceActiveFocus()
         } else if (action === "configure") {
-          root.statusMessage = "Settings saved locally"
+          root.statusMessage = "Settings saved"
           root.configured = true
           root.settingsPage = false
         }
@@ -244,7 +248,7 @@ Panel {
     onExited: function(exitCode) {
       root.downloadBusy = false
       if (exitCode === 0) {
-        root.statusMessage = root.downloadKind === "stt" ? "Speech model is ready" : "Summary model is ready"
+        root.statusMessage = root.downloadKind === "stt" ? "Transcription model installed" : "Summary model installed"
         root.statusIsError = false
         root.refreshSetup()
       } else {
@@ -262,7 +266,7 @@ Panel {
     stderr: StdioCollector { id: openError; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        root.statusMessage = String(openError.text || "Could not open transcript files").trim()
+        root.statusMessage = String(openError.text || "Could not open transcript folder").trim()
         root.statusIsError = true
       }
     }
@@ -340,14 +344,12 @@ Panel {
 
               Text {
                 width: parent.width
-                text: root.settingsPage ? "LOCAL MODELS · NO CLOUD"
-                  : root.transcriptStatus === "idle" ? "READY · AUTO LANGUAGE"
-                  : root.transcriptStatus.toUpperCase() + " · " + root.formatDuration(root.elapsedSeconds) + " · " + root.chunks + " CHUNKS"
+                visible: !root.settingsPage
+                text: root.transcriptStatus === "idle" ? "Ready"
+                  : (root.transcriptStatus === "recording" ? "Recording" : "Paused") + " · " + root.formatDuration(root.elapsedSeconds)
                 color: root.transcriptStatus === "recording" && !root.settingsPage ? root.urgent : root.accent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1
               }
             }
 
@@ -381,7 +383,7 @@ Panel {
             TextField {
               id: titleField
               width: parent.width
-              placeholderText: "Optional title — otherwise detected"
+              placeholderText: "Transcript title (optional)"
               foreground: root.foreground
               accent: root.accent
               font.family: root.fontFamily
@@ -390,7 +392,7 @@ Panel {
 
             Button {
               width: parent.width
-              text: root.busy && actionProc.action === "start" ? "Starting…" : "Start transcription"
+              text: root.busy && actionProc.action === "start" ? "Starting…" : "Start recording"
               iconText: root.busy && actionProc.action === "start" ? "󰦖" : "󰐊"
               iconSpinning: root.busy && actionProc.action === "start"
               foreground: root.accent
@@ -403,7 +405,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: root.sttShortLabel() + " · computer audio + microphone · language detected automatically"
+              text: "Computer + microphone · " + root.sttShortLabel()
               color: Qt.darker(root.foreground, 1.45)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -534,7 +536,7 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            PanelSectionHeader { text: "STORAGE"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader { text: "FILES"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             TextField {
               id: outputField
@@ -545,25 +547,28 @@ Panel {
               font.family: root.fontFamily
             }
 
-            PanelSectionHeader { text: "LOCAL MODELS"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader { text: "TRANSCRIPTION"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             Dropdown {
               id: sttDropdown
               width: parent.width
-              label: "Speech to text"
+              label: "Model"
               value: root.selectedStt
               options: root.sttOptions
               foreground: root.foreground
               accent: root.accent
               fontFamily: root.fontFamily
-              onChanged: function(value) { root.selectedStt = value; root.sttReady = false }
+              onChanged: function(value) {
+                root.selectedStt = value
+                root.sttReady = root.installedSttModels.indexOf(value) >= 0
+              }
             }
 
             Button {
               visible: !root.sttReady || (root.downloadBusy && root.downloadKind === "stt")
               width: parent.width
-              text: root.downloadBusy && root.downloadKind === "stt" ? "Downloading speech model…"
-                : root.sttReady ? "Speech model installed" : "Download selected speech model"
+              text: root.downloadBusy && root.downloadKind === "stt" ? "Downloading model…"
+                : root.sttReady ? "Installed" : "Download model"
               iconText: root.downloadBusy && root.downloadKind === "stt" ? "󰦖" : root.sttReady ? "✓" : "󰇚"
               iconSpinning: root.downloadBusy && root.downloadKind === "stt"
               foreground: root.foreground
@@ -577,16 +582,18 @@ Panel {
             Text {
               visible: root.sttReady && !(root.downloadBusy && root.downloadKind === "stt")
               width: parent.width
-              text: "✓ Speech model installed locally"
+              text: "✓ Installed"
               color: root.accent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
 
+            PanelSectionHeader { text: "SUMMARY"; foreground: root.foreground; fontFamily: root.fontFamily }
+
             Dropdown {
               id: summaryDropdown
               width: parent.width
-              label: "Markdown summary"
+              label: "Model"
               value: root.selectedSummary
               options: root.summaryOptions
               foreground: root.foreground
@@ -596,6 +603,7 @@ Panel {
                 root.selectedSummary = value
                 root.selectedAutoSummary = value !== "disabled"
                 root.summaryReady = value === "disabled"
+                  || root.installedSummaryModels.indexOf(value) >= 0
               }
             }
 
@@ -603,8 +611,8 @@ Panel {
               visible: root.selectedSummary !== "disabled"
                 && (!root.summaryReady || (root.downloadBusy && root.downloadKind === "summary"))
               width: parent.width
-              text: root.downloadBusy && root.downloadKind === "summary" ? "Downloading summary model…"
-                : root.summaryReady ? "Summary model installed" : "Download selected summary model"
+              text: root.downloadBusy && root.downloadKind === "summary" ? "Downloading model…"
+                : root.summaryReady ? "Installed" : "Download model"
               iconText: root.downloadBusy && root.downloadKind === "summary" ? "󰦖" : root.summaryReady ? "✓" : "󰇚"
               iconSpinning: root.downloadBusy && root.downloadKind === "summary"
               foreground: root.foreground
@@ -619,7 +627,7 @@ Panel {
               visible: root.selectedSummary !== "disabled" && root.summaryReady
                 && !(root.downloadBusy && root.downloadKind === "summary")
               width: parent.width
-              text: "✓ Summary model installed locally"
+              text: "✓ Installed"
               color: root.accent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -627,8 +635,8 @@ Panel {
 
             Toggle {
               width: parent.width
-              label: "Create AI summary"
-              description: "Same language as the recording"
+              label: "Create summary"
+              description: "Written in the transcript language"
               checked: root.selectedAutoSummary && root.selectedSummary !== "disabled"
               foreground: root.foreground
               accent: root.accent
@@ -639,8 +647,8 @@ Panel {
 
             Toggle {
               width: parent.width
-              label: "Keep audio file"
-              description: "Also save a compressed recording.ogg"
+              label: "Save audio"
+              description: "Keep a compressed audio copy"
               checked: root.selectedSaveAudio
               foreground: root.foreground
               accent: root.accent
@@ -648,12 +656,12 @@ Panel {
               onClicked: root.selectedSaveAudio = !root.selectedSaveAudio
             }
 
-            PanelSectionHeader { text: "SMART REMINDERS"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader { text: "REMINDERS"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             Toggle {
               width: parent.width
-              label: "Suggest transcription"
-              description: "When a selected app starts using audio"
+              label: "Recording reminders"
+              description: "Prompt when a selected app uses audio"
               checked: root.selectedDetection
               foreground: root.foreground
               accent: root.accent
@@ -665,7 +673,7 @@ Panel {
               id: appPicker
               visible: root.selectedDetection
               width: parent.width
-              label: "Apps and web apps"
+              label: "Apps"
               values: root.selectedSourceApps
               optionsCommand: [root.helperPath, "apps"]
               placeholderText: "Search installed apps…"
@@ -677,28 +685,9 @@ Panel {
               onChanged: function(values) { root.selectedSourceApps = values }
             }
 
-            Text {
-              visible: root.selectedDetection
-              width: parent.width
-              text: "Only checked apps can trigger reminders."
-              color: Qt.darker(root.foreground, 1.45)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
-            Text {
-              width: parent.width
-              text: "Downloads use the internet once; recordings and notes stay local."
-              color: Qt.darker(root.foreground, 1.45)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
             Button {
               width: parent.width
-              text: root.busy && actionProc.action === "configure" ? "Saving…" : "Save settings"
+              text: root.busy && actionProc.action === "configure" ? "Saving…" : "Save"
               iconText: root.busy && actionProc.action === "configure" ? "󰦖" : "✓"
               iconSpinning: root.busy && actionProc.action === "configure"
               foreground: root.accent

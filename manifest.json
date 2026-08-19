@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.gustavonline.local-transcript",
   "name": "Local Transcript",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": "Gustav",
   "license": "MIT",
-  "description": "Transcribe meetings, videos, podcasts, and computer audio entirely on your machine",
+  "description": "Record computer audio and microphone as searchable Markdown transcripts",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Local Transcript",
-    "description": "Local multilingual transcription, Markdown notes, app-aware reminders, and optional Ollama summaries",
+    "description": "Record, transcribe, annotate, and summarize computer audio",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right"
