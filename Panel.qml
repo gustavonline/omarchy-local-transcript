@@ -166,17 +166,6 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Shortcut {
-    sequence: "Ctrl+,"
-    context: Qt.ApplicationShortcut
-    enabled: root.opened && !root.settingsPage
-    onActivated: {
-      root.settingsPage = true
-      root.refreshSetup()
-      Qt.callLater(function() { outputField.forceActiveFocus() })
-    }
-  }
-
   Timer {
     interval: 2000
     repeat: true
