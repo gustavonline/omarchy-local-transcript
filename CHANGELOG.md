@@ -6,6 +6,8 @@
 - Removed implementation and privacy slogans from the primary interface
 - Made model readiness update immediately when a different model is selected
 - Hardened summaries against instructions embedded in transcript content
+- Added an explicit local language-detection pass before summary generation
+- Restricted decisions and action items to statements explicitly present in the transcript
 - Standardized user-facing recording errors and command override names
 
 ## 0.2.1 — 2026-08-19
