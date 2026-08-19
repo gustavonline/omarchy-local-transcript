@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 — 2026-08-19
+
+- Renamed the plugin to Local Transcript and expanded it beyond meetings
+- Added searchable multi-select discovery of installed desktop and web apps
+- Detects selected apps through active microphone, playback, and window metadata
+- Replaced the crowded setup screen with a compact main view and separate settings page
+- Replaced model cycling buttons with native dropdowns and automatic language detection
+- Updated the recommended summary model to Qwen 3 4B Instruct
+- Added transcript-aware, same-language summaries for meetings, videos, podcasts, and lectures
+- Renamed the main portable Markdown document to `transcript.md`
+
 ## 0.1.0 — 2026-08-18
 
 - Initial local-only meeting capture workflow

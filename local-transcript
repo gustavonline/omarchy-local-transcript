@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Local-only meeting capture backend for the Omarchy Local Meeting widget."""
+"""Local-only audio transcription backend for the Omarchy Local Transcript widget."""
 
 from __future__ import annotations
 
+import configparser
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -21,15 +24,15 @@ XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"
 XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
 XDG_RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 
-DATA_DIR = XDG_DATA_HOME / "omarchy-local-meeting"
+DATA_DIR = XDG_DATA_HOME / "omarchy-local-transcript"
 CONFIG_DIR = XDG_CONFIG_HOME / "omarchy"
-CONFIG_PATH = CONFIG_DIR / "local-meeting.json"
+CONFIG_PATH = CONFIG_DIR / "local-transcript.json"
 VOXTYPE_CONFIG = XDG_CONFIG_HOME / "voxtype" / "config.toml"
 VOXTYPE_MODELS = XDG_DATA_HOME / "voxtype" / "models"
 ACTIVE_PATH = DATA_DIR / "active.json"
 LAST_PATH = DATA_DIR / "last.json"
 RUNTIME_STATE = XDG_RUNTIME_DIR / "voxtype" / "meeting_state"
-OLLAMA_SERVICE = XDG_CONFIG_HOME / "systemd/user/omarchy-local-meeting-ollama.service"
+OLLAMA_SERVICE = XDG_CONFIG_HOME / "systemd/user/omarchy-local-transcript-ollama.service"
 
 VOXTYPE = os.environ.get("LOCAL_MEETING_VOXTYPE", "voxtype")
 OLLAMA = os.environ.get("LOCAL_MEETING_OLLAMA", "ollama")
@@ -40,7 +43,7 @@ HYPRCTL = os.environ.get("LOCAL_MEETING_HYPRCTL", "hyprctl")
 NOTIFY_SEND = os.environ.get("LOCAL_MEETING_NOTIFY_SEND", "notify-send")
 OMARCHY_SHELL = os.environ.get("LOCAL_MEETING_OMARCHY_SHELL", "omarchy-shell")
 
-DEFAULT_OUTPUT = Path.home() / "Documents/Meeting Notes"
+DEFAULT_OUTPUT = Path.home() / "Documents/Transcripts"
 STT_MODELS = {
     "base": {"label": "Base · light", "size": "142 MB"},
     "small": {"label": "Small · recommended", "size": "466 MB"},
@@ -48,11 +51,9 @@ STT_MODELS = {
 }
 SUMMARY_MODELS = {
     "disabled": {"label": "No AI summary", "size": "0"},
-    "gemma3:1b": {"label": "Gemma 3 1B · light", "size": "815 MB"},
-    "qwen3.5:2b": {"label": "Qwen 3.5 2B · recommended", "size": "2.7 GB"},
-    "qwen3.5:4b": {"label": "Qwen 3.5 4B · quality", "size": "3.4 GB"},
+    "qwen3:1.7b": {"label": "Qwen 3 1.7B · light", "size": "1.4 GB"},
+    "qwen3:4b-instruct": {"label": "Qwen 3 4B Instruct · recommended", "size": "2.5 GB"},
 }
-LANGUAGES = {"auto", "da", "en"}
 
 
 def now_iso() -> str:
@@ -80,17 +81,15 @@ def read_json(path: Path, default: object) -> object:
 
 def default_config() -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "configured": False,
         "outputDirectory": str(DEFAULT_OUTPUT),
         "sttModel": "small",
-        "language": "auto",
-        "summaryModel": "qwen3.5:2b",
+        "summaryModel": "qwen3:4b-instruct",
         "autoSummarize": True,
         "saveAudio": False,
-        "detectMeetings": True,
-        "detectionApps": ["zoom", "teams", "slack", "meet", "discord", "buzz", "webex", "jitsi", "browser"],
-        "customMeetingApps": "",
+        "detectSources": True,
+        "sourceApps": [],
     }
 
 
@@ -103,7 +102,7 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    config["version"] = 1
+    config["version"] = 2
     atomic_json(CONFIG_PATH, config)
 
 
@@ -184,7 +183,7 @@ def update_toml(path: Path, values: dict[str, dict[str, object]], remove: dict[s
                 insert_at -= 1
             result[insert_at:insert_at] = new_lines
 
-    temporary = path.with_suffix(path.suffix + ".local-meeting.tmp")
+    temporary = path.with_suffix(path.suffix + ".local-transcript.tmp")
     temporary.write_text("\n".join(result).rstrip() + "\n", encoding="utf-8")
     temporary.replace(path)
 
@@ -196,11 +195,11 @@ def apply_voxtype_config(config: dict) -> None:
     internal.mkdir(parents=True, exist_ok=True)
     summary_model = config["summaryModel"]
     if VOXTYPE_CONFIG.exists():
-        backup = DATA_DIR / "voxtype-config.before-local-meeting.toml"
+        backup = DATA_DIR / "voxtype-config.before-local-transcript.toml"
         if not backup.exists():
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(VOXTYPE_CONFIG, backup)
-    whisper_values = {"language": config["language"], "translate": False}
+    whisper_values = {"language": "auto", "translate": False}
     if installed_stt(config["sttModel"]):
         whisper_values["model"] = config["sttModel"]
     update_toml(
@@ -226,9 +225,9 @@ def apply_voxtype_config(config: dict) -> None:
                 "max_speakers": 10,
             },
             "meeting.summary": {
-                "backend": "disabled" if summary_model == "disabled" else "local",
+                "backend": "disabled",
                 "ollama_url": "http://127.0.0.1:11434",
-                "ollama_model": summary_model if summary_model != "disabled" else "qwen3.5:2b",
+                "ollama_model": summary_model if summary_model != "disabled" else "qwen3:4b-instruct",
                 "timeout_secs": 300,
             },
         },
@@ -244,38 +243,34 @@ def restart_voxtype() -> None:
     raise RuntimeError("Could not restart the Voxtype user service")
 
 
-def configure(output: str, stt_model: str, summary_model: str, language: str,
-              save_audio: str, auto_summarize: str, detect_meetings: str,
-              detection_apps_json: str, custom_apps: str) -> None:
+def configure(output: str, stt_model: str, summary_model: str,
+              save_audio: str, auto_summarize: str, detect_sources: str,
+              source_apps_json: str) -> None:
     if stt_model not in STT_MODELS:
         raise ValueError("Unsupported speech model")
     if summary_model not in SUMMARY_MODELS or "cloud" in summary_model.lower():
         raise ValueError("Only the bundled local summary models are allowed")
-    if language not in LANGUAGES:
-        raise ValueError("Unsupported language setting")
     try:
-        detection_apps = json.loads(detection_apps_json)
+        source_apps = json.loads(source_apps_json)
     except json.JSONDecodeError as error:
-        raise ValueError("Invalid meeting app selection") from error
-    allowed_apps = {"zoom", "teams", "slack", "meet", "discord", "buzz", "webex", "jitsi", "browser"}
-    if not isinstance(detection_apps, list) or any(item not in allowed_apps for item in detection_apps):
-        raise ValueError("Invalid meeting app selection")
+        raise ValueError("Invalid source app selection") from error
+    if (not isinstance(source_apps, list) or len(source_apps) > 256
+            or any(not isinstance(item, str) or not item.strip() or len(item) > 200 for item in source_apps)):
+        raise ValueError("Invalid source app selection")
     destination = expand_path(output)
     destination.mkdir(parents=True, exist_ok=True)
     if not destination.is_dir():
-        raise ValueError("Meeting folder is not a directory")
+        raise ValueError("Transcript folder is not a directory")
     config = load_config()
     config.update({
         "configured": True,
         "outputDirectory": str(destination),
         "sttModel": stt_model,
         "summaryModel": summary_model,
-        "language": language,
         "saveAudio": save_audio == "true",
         "autoSummarize": auto_summarize == "true" and summary_model != "disabled",
-        "detectMeetings": detect_meetings == "true",
-        "detectionApps": detection_apps,
-        "customMeetingApps": ", ".join(part.strip() for part in custom_apps.split(",") if part.strip()),
+        "detectSources": detect_sources == "true",
+        "sourceApps": list(dict.fromkeys(item.strip() for item in source_apps)),
     })
     save_config(config)
     apply_voxtype_config(config)
@@ -294,7 +289,7 @@ def ensure_ollama_service() -> None:
         raise RuntimeError("systemd user services are unavailable")
     executable = shutil.which(OLLAMA) or OLLAMA
     content = f"""[Unit]
-Description=Local Ollama for Omarchy Local Meeting
+Description=Local Ollama for Omarchy Local Transcript
 After=network-online.target
 
 [Service]
@@ -518,7 +513,7 @@ def start_meeting(title: str) -> None:
         raise RuntimeError("Download the selected multilingual speech model in Setup first")
     if runtime_meeting()[0] != "idle":
         raise RuntimeError("A meeting is already active")
-    title = clean(title) or datetime.now().strftime("Meeting %Y-%m-%d %H:%M")
+    title = clean(title) or datetime.now().strftime("Transcript %Y-%m-%d %H:%M")
     destination = expand_path(config["outputDirectory"])
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     session_dir = destination / f"{stamp}-{slugify(title)}"
@@ -584,6 +579,7 @@ def ollama_generate(model: str, prompt: str) -> str:
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "options": {"temperature": 0.2, "num_ctx": 32768},
     }).encode("utf-8")
     request = urllib.request.Request(
@@ -603,8 +599,8 @@ def ollama_generate(model: str, prompt: str) -> str:
 
 def manual_notes_markdown(notes: list[dict]) -> str:
     if not notes:
-        return "## Manual notes\n\n_No manual notes were added._\n"
-    lines = ["## Manual notes", ""]
+        return "## Manual annotations\n\n_No manual annotations were added._\n"
+    lines = ["## Manual annotations", ""]
     for note in notes:
         moment = datetime.fromisoformat(note["timestamp"]).strftime("%H:%M")
         lines.append(f"- **{moment} — {clean(note.get('author'))}:** {clean(note.get('note'))}")
@@ -631,8 +627,8 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
         "---",
         f"title: {json.dumps(title, ensure_ascii=False)}",
         f"date: {json.dumps(started)}",
-        "type: meeting",
-        "tags: [meeting]",
+        "type: transcript",
+        "tags: [transcript]",
         f"transcription_model: {json.dumps(config.get('sttModel', ''))}",
         f"summary_model: {json.dumps(config.get('summaryModel', 'disabled'))}",
         f"audio_saved: {'true' if audio_path.exists() else 'false'}",
@@ -641,7 +637,7 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
         f"# {title}",
         "",
     ]
-    links = ["## Files", "", "- [Structured transcript](transcript.json)"]
+    links = ["## Source files", "", "- [Structured transcript](transcript.json)"]
     if audio_path.exists():
         links.append("- [Audio recording](recording.ogg)")
     sections = ["\n".join(frontmatter)]
@@ -650,7 +646,7 @@ def finish_document(active: dict, summary: str, transcript: str, info: dict) -> 
     sections.append(manual_notes_markdown(notes))
     sections.append("\n".join(links) + "\n")
     sections.append(strip_export_header(transcript))
-    output = directory / "meeting.md"
+    output = directory / "transcript.md"
     output.write_text("\n".join(part.rstrip() for part in sections).rstrip() + "\n", encoding="utf-8")
     return output
 
@@ -684,15 +680,17 @@ def stop_meeting() -> None:
     if config.get("autoSummarize") and model != "disabled":
         notes = manual_notes_markdown(read_notes(directory))
         source = transcript[-120000:]
-        prompt = f"""You are producing accurate meeting notes from a transcript.
-Use the same primary language as the transcript, including Danish when the meeting is Danish.
-Return only standard Markdown with these exact second-level headings:
+        prompt = f"""This is a transcript of a meeting, interview, lecture, video, podcast, or other spoken content.
+Detect the transcript's primary language and write the result in that same language.
+Use speaker/source labels as evidence, but never invent speaker identities. "You" means microphone input and "Remote" means computer audio; multiple people may share the Remote label.
+Return only standard Markdown with these exact second-level headings, translated naturally when appropriate:
 ## Summary
 ## Key points
 ## Decisions
 ## Action items
-Use concise bullets. Action items must use Markdown checkboxes. Include an assignee only when explicit.
-Treat manual notes as important signals. Do not invent facts, decisions, deadlines, or owners.
+Use a short paragraph for the summary and concise bullets elsewhere. Action items must use Markdown checkboxes.
+For non-meeting content, state that decisions or action items were not present instead of inventing them.
+Treat manual annotations as important signals. Do not invent facts, identities, decisions, deadlines, or owners.
 
 {notes}
 
@@ -761,7 +759,7 @@ def open_target() -> None:
 def setup_state() -> None:
     config = load_config()
     models = ollama_models()
-    selected_summary = config.get("summaryModel", "qwen3.5:2b")
+    selected_summary = config.get("summaryModel", "qwen3:4b-instruct")
     print(json.dumps({
         "config": config,
         "requirements": {
@@ -792,7 +790,7 @@ def state() -> None:
         "configured": bool(config.get("configured")),
         "meeting_status": status,
         "meeting_id": meeting_id,
-        "title": clean(active.get("title")) or clean(details.get("title")) or "Local Meeting",
+        "title": clean(active.get("title")) or clean(details.get("title")) or "Local Transcript",
         "elapsed_seconds": elapsed,
         "chunks": int(details.get("chunks", 0) or 0),
         "session_dir": active.get("session_dir", ""),
@@ -804,9 +802,95 @@ def state() -> None:
     }, ensure_ascii=False))
 
 
-def microphone_clients() -> list[dict]:
-    """Return active microphone consumers from PipeWire's PulseAudio view."""
-    result = run([PACTL, "--format=json", "list", "source-outputs"], check=False, timeout=8)
+def desktop_entry_paths() -> list[Path]:
+    roots = [XDG_DATA_HOME / "applications"]
+    roots.extend(Path(value) / "applications" for value in os.environ.get(
+        "XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") if value)
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.desktop")):
+            identity = path.name.casefold()
+            if identity not in seen:
+                seen.add(identity)
+                paths.append(path)
+    return paths
+
+
+def executable_from_desktop(exec_line: str) -> tuple[str, str]:
+    try:
+        parts = shlex.split(exec_line)
+    except ValueError:
+        parts = exec_line.split()
+    parts = [part for part in parts if not re.fullmatch(r"%[A-Za-z]", part)]
+    url = next((part for part in parts if part.startswith(("http://", "https://"))), "")
+    command = ""
+    for part in parts:
+        if part == "env" or "=" in part and not part.startswith("/"):
+            continue
+        command = Path(part).name
+        break
+    return command, url
+
+
+def installed_apps() -> list[dict]:
+    apps: list[dict] = []
+    ignored_tokens = {
+        "application", "desktop", "launch", "launcher", "omarchy", "webapp",
+        "handler", "https", "http", "www", "com", "org", "bin", "usr",
+    }
+    for path in desktop_entry_paths():
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        parser.optionxform = str
+        try:
+            parser.read(path, encoding="utf-8")
+            entry = parser["Desktop Entry"]
+        except (OSError, KeyError, configparser.Error):
+            continue
+        if entry.get("Type", "Application") != "Application":
+            continue
+        if entry.get("Hidden", "false").lower() == "true" or entry.get("NoDisplay", "false").lower() == "true":
+            continue
+        name = clean(entry.get("Name", ""))
+        if not name:
+            continue
+        desktop_id = path.stem
+        startup_class = clean(entry.get("StartupWMClass", ""))
+        executable, url = executable_from_desktop(entry.get("Exec", ""))
+        host = urllib.parse.urlparse(url).hostname or ""
+        candidates = [desktop_id, name, startup_class, executable, host]
+        tokens: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.casefold().replace("_", " ").replace("-", " ")
+            if len(normalized.strip()) >= 3:
+                tokens.add(normalized.strip())
+            for part in re.findall(r"[\w.]+", normalized, flags=re.UNICODE):
+                bare = part.strip(".")
+                if len(bare) >= 3 and bare not in ignored_tokens:
+                    tokens.add(bare)
+        description = host.removeprefix("www.") if host else startup_class or executable or desktop_id
+        apps.append({
+            "value": desktop_id,
+            "label": name,
+            "description": description,
+            "tokens": sorted(tokens, key=lambda value: (-len(value), value)),
+        })
+    return sorted(apps, key=lambda app: (app["label"].casefold(), app["value"].casefold()))
+
+
+def app_options() -> None:
+    print(json.dumps([
+        {"value": app["value"], "label": app["label"], "description": app["description"]}
+        for app in installed_apps()
+    ], ensure_ascii=False))
+
+
+def audio_clients(kind: str) -> list[dict]:
+    """Return active recording or playback clients from PipeWire's PulseAudio view."""
+    target = "source-outputs" if kind == "recording" else "sink-inputs"
+    result = run([PACTL, "--format=json", "list", target], check=False, timeout=8)
     if result.returncode != 0:
         return []
     try:
@@ -818,90 +902,64 @@ def microphone_clients() -> list[dict]:
         if item.get("mute") is True or item.get("corked") is True:
             continue
         properties = item.get("properties") if isinstance(item.get("properties"), dict) else {}
-        haystack = " ".join(str(value) for value in properties.values()).lower()
-        if any(token in haystack for token in ("voxtype", "local-meeting", "ffmpeg")):
+        haystack = " ".join(str(value) for value in properties.values()).casefold()
+        if any(token in haystack for token in ("voxtype", "local-transcript", "local-meeting", "ffmpeg")):
             continue
-        clients.append({"properties": properties, "haystack": haystack})
+        clients.append({"properties": properties, "haystack": haystack, "kind": kind})
     return clients
 
 
-def meeting_windows() -> str:
+def application_windows() -> list[str]:
     if not command_exists(HYPRCTL):
-        return ""
+        return []
     result = run([HYPRCTL, "clients", "-j"], check=False, timeout=8)
     if result.returncode != 0:
-        return ""
+        return []
     try:
         clients = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
-        return ""
-    values = []
+        return []
+    windows = []
     for item in clients if isinstance(clients, list) else []:
         if not isinstance(item, dict):
             continue
-        values.extend([item.get("class", ""), item.get("initialClass", ""),
-                       item.get("title", ""), item.get("initialTitle", "")])
-    return " ".join(str(value) for value in values).lower()
+        values = [item.get("class", ""), item.get("initialClass", ""),
+                  item.get("title", ""), item.get("initialTitle", "")]
+        windows.append(" ".join(str(value) for value in values).casefold())
+    return windows
 
 
-def detect_meeting_app(config: dict) -> str:
-    clients = microphone_clients()
+def detect_source_app(config: dict) -> str:
+    selected = set(config.get("sourceApps", []))
+    if not selected:
+        return ""
+    apps = [app for app in installed_apps() if app["value"] in selected]
+    if not apps:
+        return ""
+    recording = audio_clients("recording")
+    playback = audio_clients("playback")
+    clients = recording + playback
+    for app in apps:
+        if any(any(token in client["haystack"] for token in app["tokens"]) for client in clients):
+            return app["label"]
     if not clients:
         return ""
-    enabled = set(config.get("detectionApps", default_config()["detectionApps"]))
-    direct_apps = [
-        ("zoom", "zoom", "Zoom"),
-        ("teams", "microsoft teams", "Microsoft Teams"),
-        ("teams", "teams", "Microsoft Teams"),
-        ("discord", "discord", "Discord"),
-        ("discord", "vesktop", "Discord / Vesktop"),
-        ("discord", "webcord", "Discord / WebCord"),
-        ("slack", "slack", "Slack"),
-        ("buzz", "buzz", "Buzz"),
-        ("webex", "webex", "Webex"),
-        ("jitsi", "jitsi", "Jitsi"),
-    ]
-    for client in clients:
-        for app_id, token, label in direct_apps:
-            if app_id in enabled and token in client["haystack"]:
-                return label
-
-    windows = meeting_windows()
-    window_apps = [
-        ("meet", "meet.google", "Google Meet"),
-        ("meet", "google meet", "Google Meet"),
-        ("slack", "slack huddle", "Slack Huddle"),
-        ("teams", "microsoft teams", "Microsoft Teams"),
-        ("zoom", "zoom meeting", "Zoom"),
-        ("discord", "discord", "Discord"),
-        ("browser", "whereby", "Whereby"),
-        ("jitsi", "jitsi meet", "Jitsi"),
-    ]
-    for app_id, token, label in window_apps:
-        if app_id in enabled and token in windows:
-            return label
-
-    browser_tokens = ("chromium", "chrome", "brave", "firefox", "zen", "vivaldi", "edge")
-    if "browser" in enabled and any(any(token in client["haystack"] for token in browser_tokens) for client in clients):
-        return "Browser call"
-
-    custom_tokens = [part.strip().lower() for part in str(config.get("customMeetingApps", "")).split(",") if part.strip()]
-    combined = windows + " " + " ".join(client["haystack"] for client in clients)
-    for token in custom_tokens:
-        if token in combined:
-            return token
+    windows = application_windows()
+    for app in apps:
+        if any(any(token in window for token in app["tokens"]) for window in windows):
+            return app["label"]
     return ""
 
 
 def detect() -> None:
     config = load_config()
-    if not config.get("configured") or not config.get("detectMeetings", True):
+    if not config.get("configured") or not config.get("detectSources", True):
         print(json.dumps({"detected": False}))
         return
     if runtime_meeting()[0] != "idle":
         print(json.dumps({"detected": False, "reason": "already-recording"}))
         return
-    app = detect_meeting_app(config)
+    app = detect_source_app(config)
     detection_path = DATA_DIR / "detection.json"
     state_value = read_json(detection_path, {})
     detection = state_value if isinstance(state_value, dict) else {}
@@ -926,18 +984,18 @@ def detect() -> None:
     if command_exists(NOTIFY_SEND):
         result = run([
             NOTIFY_SEND,
-            "--app-name=Local Meeting",
-            "--icon=audio-input-microphone",
+            "--app-name=Local Transcript",
+            "--icon=text-x-generic",
             "--urgency=normal",
             "--expire-time=15000",
-            "--action=open=Open Local Meeting",
+            "--action=open=Open Local Transcript",
             "--action=dismiss=Not now",
-            "Meeting detected",
-            f"{app} is using your microphone. Start local recording and notes?",
+            "Audio source detected",
+            f"{app} is using audio. Start a local transcript?",
         ], check=False, timeout=60)
         action = result.stdout.strip()
     if action == "open" and command_exists(OMARCHY_SHELL):
-        run([OMARCHY_SHELL, "-q", "io.github.gustavonline.local-meeting", "toggle"], check=False, timeout=10)
+        run([OMARCHY_SHELL, "-q", "io.github.gustavonline.local-transcript", "toggle"], check=False, timeout=10)
     print(json.dumps({"detected": True, "app": app, "notified": True, "action": action}))
 
 
@@ -949,9 +1007,9 @@ def main() -> None:
     elif command == "setup-state":
         setup_state()
     elif command == "configure":
-        if len(sys.argv) != 11:
-            raise ValueError("Usage: local-meeting configure DIR STT SUMMARY LANGUAGE SAVE_AUDIO AUTO_SUMMARIZE DETECT APPS CUSTOM")
-        configure(*sys.argv[2:11])
+        if len(sys.argv) != 9:
+            raise ValueError("Usage: local-transcript configure DIR STT SUMMARY SAVE_AUDIO AUTO_SUMMARIZE DETECT APPS")
+        configure(*sys.argv[2:9])
     elif command == "download-stt":
         download_stt(sys.argv[2])
     elif command == "download-summary":
@@ -964,12 +1022,14 @@ def main() -> None:
         stop_meeting()
     elif command == "add-note":
         if len(sys.argv) != 4:
-            raise ValueError("Usage: local-meeting add-note AUTHOR NOTE")
+            raise ValueError("Usage: local-transcript add-note AUTHOR NOTE")
         write_note(sys.argv[2], sys.argv[3])
     elif command == "open":
         open_target()
     elif command == "detect":
         detect()
+    elif command == "apps":
+        app_options()
     else:
         raise ValueError(f"Unknown command: {command}")
 

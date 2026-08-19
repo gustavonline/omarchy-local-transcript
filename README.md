@@ -1,129 +1,116 @@
-# Local Meeting for Omarchy
+# Local Transcript for Omarchy
 
-A local-first Omarchy bar widget for recording, transcribing, annotating, and
-summarizing meetings. Audio and inference stay on your computer. The only
-network activity is an explicit, one-time model download initiated by you.
+Local Transcript is a local-first Omarchy bar widget for recording, transcribing,
+annotating, and summarizing meetings, videos, lectures, podcasts, and other
+spoken computer audio. Audio and inference stay on your computer. Network access
+is used only when you explicitly download a model.
 
 ## What it does
 
-- Captures microphone and desktop audio through PipeWire/PulseAudio
+- Captures computer audio and microphone input through PipeWire/PulseAudio
 - Uses Voxtype meeting mode for continuous multilingual speech-to-text
-- Separates your microphone (`You`) from desktop audio (`Remote`)
-- Adds timestamped manual notes during the meeting
+- Labels microphone audio as `You` and computer audio as `Remote`
+- Adds timestamped manual annotations while recording
 - Optionally saves a compressed `recording.ogg`
-- Exports a standard Markdown meeting note and structured transcript JSON
-- Optionally creates a local AI summary with Ollama
-- Detects likely meetings from active microphone clients and window metadata
-- Lets you enable, disable, or add meeting apps used by the detector
+- Exports a portable Markdown transcript plus structured transcript JSON
+- Optionally creates a same-language local summary with Ollama
+- Can suggest transcription when selected installed apps begin using audio
+- Discovers desktop and Omarchy web apps automatically in a searchable picker
 
-## Local model choices
+## Recommended local models
 
-Speech-to-text models are downloaded and run by Voxtype:
+Speech recognition uses the multilingual—not `.en`—Whisper variants:
 
-| Model | Approximate download | Use case |
+| Model | Download | Guidance |
 |---|---:|---|
-| `base` | 142 MB | Very light, lower accuracy |
-| `small` | 466 MB | Recommended multilingual default |
-| `large-v3-turbo` | 1.6 GB | Best accuracy on capable hardware |
+| `base` | 142 MB | Lightest option, lower accuracy |
+| `small` | 466 MB | Recommended balance for general Omarchy computers |
+| `large-v3-turbo` | 1.6 GB | Better accuracy, heavier memory/compute use |
 
-Summary models are downloaded and run by Ollama:
+The optional summary uses Ollama:
 
-| Model | Approximate download | Use case |
+| Model | Download | Guidance |
 |---|---:|---|
-| `gemma3:1b` | 815 MB | Smallest useful multilingual option |
-| `qwen3.5:2b` | 2.7 GB | Recommended quality/size balance |
-| `qwen3.5:4b` | 3.4 GB | Better summaries, more memory |
+| Disabled | 0 | Markdown transcript without AI summary |
+| `qwen3:1.7b` | 1.4 GB | Light summary option |
+| `qwen3:4b-instruct` | 2.5 GB | Recommended quality/size balance |
 
-AI summaries can be disabled entirely. Cloud model tags are blocked by the
-backend. The Ollama API is bound to `127.0.0.1` only.
-
-## Requirements
-
-- Omarchy with the Quickshell plugin system
-- Voxtype 0.7.5 or newer
-- PipeWire with PulseAudio compatibility (`pactl`)
-- Python 3
-- `ffmpeg` when saving the actual audio file
-- Ollama only when AI summaries are enabled
+Qwen thinking is disabled for this summarization task. The summary prompt detects
+the transcript language, writes in the same language, respects `You`/`Remote`
+source labels, and avoids inventing speaker identities or meeting decisions.
 
 ## Install
 
-From a local checkout:
-
 ```bash
-omarchy plugin add /path/to/omarchy-local-meeting --enable --yes
+omarchy plugin add /path/to/omarchy-local-transcript --enable --yes
 ```
 
-Open the bar widget and complete **Setup**. Choose a folder, speech model,
-language mode, summary model, audio retention preference, and meeting apps.
-Downloads only begin when you press the corresponding download button.
+Open the document icon in the bar. The main panel is intentionally limited to
+title, start/stop, pause, quick annotations, and opening the latest transcript.
+Use the cog button for storage, model downloads, audio retention, and reminders.
 
-## Meeting detection
+## App-aware reminders
 
-The widget polls local PipeWire metadata while loaded. A reminder is shown
-only when an enabled app is actively using the microphone for two consecutive
-checks. Notifications have a 30-minute cooldown.
+The settings page contains a searchable multi-select populated from the actual
+`.desktop` applications installed on the computer, including Omarchy web apps.
+For example, you can select Zoom, Discord, Zen Browser, or YouTube independently.
 
-Built-in toggles cover Zoom, Microsoft Teams, Slack, Google Meet, Discord,
-Buzz, Webex, Jitsi, and generic browser calls. Add other app or process names
-as a comma-separated list. Disable Discord or generic browser detection if
-those cause reminders during gaming or voice chat.
+Detection checks local PipeWire recording/playback metadata and Hyprland window
+metadata. It never inspects audio content. A notification requires two consecutive
+detections and then has a 30-minute cooldown. Leaving Discord or Zen Browser
+unchecked prevents reminders from those apps.
 
-Detection reads process/application metadata and Hyprland window titles. It
-does not capture or inspect conversation audio.
+You do not need to enable an app to transcribe it manually. For a YouTube video,
+start Local Transcript and play the video; its computer audio is captured as
+`Remote`.
 
 ## Output
 
-Each meeting gets a portable folder:
+Each recording gets a portable folder:
 
 ```text
-Meeting Notes/
-  2026-08-18-143000-project-kickoff/
-    meeting.md
+Transcripts/
+  2026-08-19-143000-video-title/
+    transcript.md
     transcript.json
     manual-notes.jsonl
     recording.ogg       # optional
 ```
 
-`meeting.md` uses standard Markdown and YAML frontmatter, with these sections:
+The main Markdown file contains YAML frontmatter, an optional summary, key points,
+decisions and checkbox actions, manual annotations, relative source-file links,
+and a timestamped speaker/source transcript.
 
-- Summary, key points, decisions, and checkbox action items (optional)
-- Manual notes
-- Relative links to the structured transcript and optional recording
-- Timestamped speaker transcript
+Voxtype's crash-resistant internal data is stored in the hidden `.voxtype-data`
+folder inside the selected output directory.
 
-Voxtype's internal crash-resistant meeting data is kept in the hidden
-`.voxtype-data` folder inside the selected meeting directory.
+## Privacy and consent
 
-## Privacy and recording consent
-
-No meeting content is sent to a cloud service. Model downloads contact the
-Voxtype/Ollama model registries, but inference happens locally afterwards.
-The red bar icon makes active capture visible. You remain responsible for
-informing participants and obtaining any consent required by your workplace
-or local rules.
+No recording content is sent to a cloud service. The plugin starts an Ollama user
+service bound to `127.0.0.1` only after a summary model download. The red bar icon
+makes active capture visible. You remain responsible for informing participants
+and obtaining any consent required by local rules or your workplace.
 
 ## Development
 
 ```bash
 omarchy plugin validate .
-python3 -m py_compile local-meeting
+python3 -m py_compile local-transcript
 python3 tests/test_backend.py
 ```
 
-The backend stores plugin settings in
-`~/.config/omarchy/local-meeting.json`. Before its first Voxtype edit it saves
-a copy of the prior configuration under
-`~/.local/share/omarchy-local-meeting/voxtype-config.before-local-meeting.toml`.
+Settings live in `~/.config/omarchy/local-transcript.json`. Before the first
+Voxtype edit, the previous Voxtype configuration is backed up under
+`~/.local/share/omarchy-local-transcript/voxtype-config.before-local-transcript.toml`.
 
 ## Remove
 
 ```bash
-omarchy plugin remove io.github.gustavonline.local-meeting
+omarchy plugin remove io.github.gustavonline.local-transcript
 ```
 
-Removing the plugin does not delete meeting folders, downloaded models, or
-the optional user-level Ollama service created after a model download.
+Removing the plugin does not delete transcripts, downloaded models, or the
+optional user-level Ollama service.
 
 ## License
 

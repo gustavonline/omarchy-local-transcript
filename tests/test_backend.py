@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_backend():
-    loader = importlib.machinery.SourceFileLoader("local_meeting", str(ROOT / "local-meeting"))
+    loader = importlib.machinery.SourceFileLoader("local_transcript", str(ROOT / "local-transcript"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -26,7 +26,7 @@ class BackendTests(unittest.TestCase):
         base = Path(self.temp.name)
         self.module.DATA_DIR = base / "data"
         self.module.CONFIG_DIR = base / "config/omarchy"
-        self.module.CONFIG_PATH = self.module.CONFIG_DIR / "local-meeting.json"
+        self.module.CONFIG_PATH = self.module.CONFIG_DIR / "local-transcript.json"
         self.module.VOXTYPE_CONFIG = base / "config/voxtype/config.toml"
         self.module.VOXTYPE_MODELS = base / "models"
         self.module.ACTIVE_PATH = self.module.DATA_DIR / "active.json"
@@ -57,53 +57,80 @@ class BackendTests(unittest.TestCase):
         self.assertNotIn('source = "mic"', text)
         self.assertIn('[osd]\nenabled = true', text)
 
-    def test_markdown_document_is_portable(self):
-        session = Path(self.temp.name) / "meeting"
+    def test_markdown_document_is_portable_and_generic(self):
+        session = Path(self.temp.name) / "transcript"
         session.mkdir()
         (session / "transcript.json").write_text("{}\n", encoding="utf-8")
         active = {
-            "title": "Dansk statusmøde",
-            "started_at": "2026-08-18T14:30:00+02:00",
+            "title": "Dansk video",
+            "started_at": "2026-08-19T14:30:00+02:00",
             "session_dir": str(session),
         }
         self.module.atomic_json(self.module.CONFIG_PATH, {
             **self.module.default_config(),
             "sttModel": "small",
-            "summaryModel": "qwen3.5:2b",
+            "summaryModel": "qwen3:4b-instruct",
         })
         (session / "manual-notes.jsonl").write_text(
-            json.dumps({"timestamp": "2026-08-18T14:31:00+02:00", "author": "Gustav", "note": "Send planen"}) + "\n",
+            json.dumps({"timestamp": "2026-08-19T14:31:00+02:00", "author": "Me", "note": "Vigtig pointe"}) + "\n",
             encoding="utf-8",
         )
         output = self.module.finish_document(
             active,
             "## Summary\n\nKort dansk resumé.",
-            "# Dansk statusmøde\n\n## Transcript\n\n*[00:01]* Hej.\n",
+            "# Dansk video\n\n## Transcript\n\n*[00:01]* Remote: Hej.\n",
             {},
         )
         text = output.read_text(encoding="utf-8")
-        self.assertIn("tags: [meeting]", text)
-        self.assertIn("## Manual notes", text)
-        self.assertIn("- **14:31 — Gustav:** Send planen", text)
+        self.assertEqual(output.name, "transcript.md")
+        self.assertIn("tags: [transcript]", text)
+        self.assertIn("## Manual annotations", text)
+        self.assertIn("- **14:31 — Me:** Vigtig pointe", text)
         self.assertIn("[Structured transcript](transcript.json)", text)
-        self.assertEqual(text.count("# Dansk statusmøde"), 1)
+        self.assertEqual(text.count("# Dansk video"), 1)
+
+    def test_installed_desktop_apps_are_exposed_as_picker_options(self):
+        app_dir = Path(self.temp.name) / "applications"
+        app_dir.mkdir()
+        youtube = app_dir / "YouTube.desktop"
+        youtube.write_text(
+            "[Desktop Entry]\nType=Application\nName=YouTube\nExec=omarchy-launch-webapp https://youtube.com/\n",
+            encoding="utf-8",
+        )
+        hidden = app_dir / "Hidden.desktop"
+        hidden.write_text(
+            "[Desktop Entry]\nType=Application\nName=Hidden\nNoDisplay=true\nExec=hidden\n",
+            encoding="utf-8",
+        )
+        self.module.desktop_entry_paths = lambda: [youtube, hidden]
+        apps = self.module.installed_apps()
+        self.assertEqual([app["value"] for app in apps], ["YouTube"])
+        self.assertIn("youtube", apps[0]["tokens"])
+        self.assertEqual(apps[0]["description"], "youtube.com")
 
     def test_discord_can_be_excluded(self):
-        self.module.microphone_clients = lambda: [{"haystack": "discord discordcanary", "properties": {}}]
-        self.module.meeting_windows = lambda: "discord voice channel"
+        self.module.installed_apps = lambda: [
+            {"value": "Discord", "label": "Discord", "description": "discord.com", "tokens": ["discord"]}
+        ]
+        self.module.audio_clients = lambda kind: [{"haystack": "discord", "properties": {}, "kind": kind}]
+        self.module.application_windows = lambda: ["discord voice channel"]
         config = self.module.default_config()
-        config["detectionApps"] = [item for item in config["detectionApps"] if item != "discord"]
-        self.assertEqual(self.module.detect_meeting_app(config), "")
-        config["detectionApps"].append("discord")
-        self.assertEqual(self.module.detect_meeting_app(config), "Discord")
+        config["sourceApps"] = []
+        self.assertEqual(self.module.detect_source_app(config), "")
+        config["sourceApps"] = ["Discord"]
+        self.assertEqual(self.module.detect_source_app(config), "Discord")
 
-    def test_custom_microphone_app_can_be_added(self):
-        self.module.microphone_clients = lambda: [{"haystack": "application.name mycompanycall", "properties": {}}]
-        self.module.meeting_windows = lambda: ""
+    def test_youtube_window_with_playback_can_be_detected(self):
+        self.module.installed_apps = lambda: [
+            {"value": "YouTube", "label": "YouTube", "description": "youtube.com", "tokens": ["youtube"]}
+        ]
+        self.module.audio_clients = lambda kind: (
+            [{"haystack": "zen browser audio", "properties": {}, "kind": kind}] if kind == "playback" else []
+        )
+        self.module.application_windows = lambda: ["video title - youtube — zen browser"]
         config = self.module.default_config()
-        config["detectionApps"] = []
-        config["customMeetingApps"] = "mycompanycall"
-        self.assertEqual(self.module.detect_meeting_app(config), "mycompanycall")
+        config["sourceApps"] = ["YouTube"]
+        self.assertEqual(self.module.detect_source_app(config), "YouTube")
 
 
 if __name__ == "__main__":
