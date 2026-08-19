@@ -168,6 +168,7 @@ Panel {
 
   Shortcut {
     sequence: "Ctrl+,"
+    context: Qt.ApplicationShortcut
     enabled: root.opened && !root.settingsPage
     onActivated: {
       root.settingsPage = true
