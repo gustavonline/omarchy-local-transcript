@@ -40,7 +40,7 @@ labels, and avoids inventing speaker identities, decisions, or action items.
 ## Install
 
 ```bash
-omarchy plugin add /path/to/omarchy-local-transcript --enable --yes
+omarchy plugin add https://github.com/gustavonline/omarchy-local-transcript --enable --yes
 ```
 
 Open the document icon in the bar. The main panel contains the transcript title,
