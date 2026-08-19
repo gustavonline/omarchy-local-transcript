@@ -341,10 +341,23 @@ def installed_ollama(model: str) -> bool:
 def download_stt(model: str) -> None:
     if model not in STT_MODELS:
         raise ValueError("Unsupported speech model")
-    run(
-        [VOXTYPE, "setup", "--download", "--model", model, "--no-post-install"],
-        timeout=None,
-    )
+    VOXTYPE_MODELS.mkdir(parents=True, exist_ok=True)
+    target = VOXTYPE_MODELS / f"ggml-{model}.bin"
+    if not target.exists():
+        curl = shutil.which("curl")
+        if not curl:
+            raise RuntimeError("curl is required to download the speech model")
+        temporary = target.with_suffix(target.suffix + ".download")
+        url = f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{target.name}"
+        result = subprocess.run(
+            [curl, "--fail", "--location", "--progress-bar", "--output", str(temporary), url],
+            text=True,
+            timeout=None,
+        )
+        if result.returncode != 0 or not temporary.exists() or temporary.stat().st_size < 1_000_000:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(f"Could not download speech model {model}")
+        temporary.replace(target)
     run([VOXTYPE, "setup", "model", "--set", model, "--restart"], timeout=60)
     config = load_config()
     config["sttModel"] = model
